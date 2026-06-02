@@ -17,7 +17,8 @@ from config import TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY
 from db import (
     register_user, save_user_search, get_user_searches, delete_user_search,
     get_all_active_searches, update_last_checked_price, get_all_transit_hubs,
-    get_all_manual_legs
+    get_all_manual_legs, save_search_snapshot, get_route_snapshot,
+    get_snapshot_routes, get_discovery_cache, save_discovery_cache
 )
 from providers import TravelpayoutsProvider
 from solver import GraphSolver
@@ -242,6 +243,71 @@ async def send_message_safely(chat_id: int, text: str):
             except Exception as e2:
                 logger.error(f"Plain text send failed as well: {e2}")
 
+def _parse_route_command_args(text: str) -> tuple[str | None, int | None]:
+    parts = text.split()
+    if len(parts) < 2:
+        return None, None
+    route_id = parts[1].strip().upper()
+    search_id = None
+    if len(parts) >= 3:
+        try:
+            search_id = int(parts[2])
+        except ValueError:
+            search_id = None
+    return route_id, search_id
+
+def _parse_more_routes_args(text: str) -> tuple[int | None, int, str]:
+    parts = text.split()[1:]
+    search_id = None
+    offset = 5
+    sort_mode = "balanced"
+    aliases = {
+        "price": "price", "цена": "price", "дешевле": "price",
+        "duration": "duration", "time": "duration", "быстрее": "duration",
+        "comfort": "comfort", "удобнее": "comfort",
+        "stopover": "stopover", "стоповер": "stopover",
+        "balanced": "balanced", "баланс": "balanced",
+    }
+
+    for part in parts:
+        cleaned = part.strip().lower()
+        if cleaned.startswith("search="):
+            try:
+                search_id = int(cleaned.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif cleaned.startswith("offset="):
+            try:
+                offset = max(0, int(cleaned.split("=", 1)[1]))
+            except ValueError:
+                pass
+        elif cleaned in aliases:
+            sort_mode = aliases[cleaned]
+        else:
+            try:
+                offset = max(0, int(cleaned))
+            except ValueError:
+                pass
+
+    return search_id, offset, sort_mode
+
+async def _render_snapshot_routes(rows: list[dict], metadata: dict | None = None) -> str:
+    routes = [json.loads(row["route_json"]) for row in rows]
+    solved_data = {
+        "recommended": routes,
+        "is_fallback_active": False,
+        "total_routes_after_filter": metadata.get("total_routes_after_filter", 0) if metadata else 0,
+        "rendered_routes_count": len(routes)
+    }
+    return await analyst.analyze_routes(
+        origin="",
+        destination="",
+        date_range="",
+        max_budget=0,
+        solved_data=solved_data,
+        search_metadata=None
+    )
+
 # Command Handlers
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -428,7 +494,7 @@ async def process_exclusions(message: types.Message, state: FSMContext):
     await state.clear()
     
     # Save search preferences in DB (DOP-1 / async-safe thread)
-    await asyncio.to_thread(
+    search_id = await asyncio.to_thread(
         save_user_search,
         user_id=message.from_user.id,
         origin_iata=data["origin_iata"],
@@ -446,6 +512,7 @@ async def process_exclusions(message: types.Message, state: FSMContext):
     
     await message.answer(
         "🎉 **Мониторинг успешно настроен!**\n\n"
+        f"🆔 ID поиска: `{search_id}`\n"
         f"📍 Маршрут: `{data['origin_name']} ({data['origin_iata']})` ➔ `{data['dest_name']} ({data['dest_iata']})`\n"
         f"📅 Период: {data['date_start']} — {data['date_end']}\n"
         f"💰 Бюджет: до {data['max_budget']:,} ₽\n"
@@ -456,6 +523,7 @@ async def process_exclusions(message: types.Message, state: FSMContext):
     
     # Trigger immediate calculation
     immediate_config = {
+        "search_id": search_id,
         "origin_iata": data["origin_iata"],
         "dest_iata": data["dest_iata"],
         "date_start": data["date_start"],
@@ -496,6 +564,71 @@ async def cmd_delete_search(message: types.Message):
     except Exception as e:
         await message.answer("❌ Неверный ID поиска. Попробуйте еще раз.")
 
+@router.message(Command("route"))
+async def cmd_route_details(message: types.Message):
+    route_id, search_id = _parse_route_command_args(message.text or "")
+    if not route_id:
+        await message.answer("Укажите route_id: `/route R-ABC123`\nМожно уточнить поиск: `/route R-ABC123 12`")
+        return
+
+    row = await asyncio.to_thread(get_route_snapshot, message.from_user.id, route_id, search_id)
+    if not row:
+        await message.answer("Не нашел такой маршрут в ваших последних результатах. Запустите поиск заново или проверьте route_id.")
+        return
+
+    metadata = json.loads(row.get("metadata_json") or "{}")
+    text = await _render_snapshot_routes([row], metadata)
+    await send_message_safely(message.chat.id, "📌 *Детали маршрута*\n\n" + text)
+
+@router.message(Command("more_routes", "more"))
+async def cmd_more_routes(message: types.Message):
+    search_id, offset, sort_mode = _parse_more_routes_args(message.text or "")
+    snapshot, rows = await asyncio.to_thread(get_snapshot_routes, message.from_user.id, search_id, offset, 5, sort_mode)
+    if not snapshot:
+        await message.answer("Пока нет сохраненного результата. Сначала запустите /new_search.")
+        return
+    if not rows:
+        await message.answer("Больше сохраненных маршрутов для этого поиска нет.")
+        return
+
+    metadata = json.loads(snapshot.get("metadata_json") or "{}")
+    text = await _render_snapshot_routes(rows, metadata)
+    next_offset = offset + len(rows)
+    text += (
+        f"\n\nПоказаны варианты с offset={offset}, сортировка: {sort_mode}."
+        f"\nЕще: `/more_routes offset={next_offset} {sort_mode}`"
+    )
+    await send_message_safely(message.chat.id, text)
+
+async def _send_sorted_routes(message: types.Message, sort_mode: str):
+    snapshot, rows = await asyncio.to_thread(get_snapshot_routes, message.from_user.id, None, 0, 5, sort_mode)
+    if not snapshot:
+        await message.answer("Пока нет сохраненного результата. Сначала запустите /new_search.")
+        return
+    if not rows:
+        await message.answer("В сохраненном результате нет маршрутов.")
+        return
+    metadata = json.loads(snapshot.get("metadata_json") or "{}")
+    text = await _render_snapshot_routes(rows, metadata)
+    text += f"\n\nСортировка: {sort_mode}. Еще: `/more_routes offset=5 {sort_mode}`"
+    await send_message_safely(message.chat.id, text)
+
+@router.message(Command("routes_by_price"))
+async def cmd_routes_by_price(message: types.Message):
+    await _send_sorted_routes(message, "price")
+
+@router.message(Command("routes_by_duration"))
+async def cmd_routes_by_duration(message: types.Message):
+    await _send_sorted_routes(message, "duration")
+
+@router.message(Command("routes_by_comfort"))
+async def cmd_routes_by_comfort(message: types.Message):
+    await _send_sorted_routes(message, "comfort")
+
+@router.message(Command("routes_by_stopover"))
+async def cmd_routes_by_stopover(message: types.Message):
+    await _send_sorted_routes(message, "stopover")
+
 # Logic execution & background task
 async def run_single_search_and_send(user_id: int, chat_id: int, search_config: dict, is_monitor_job: bool = False):
     """Executes a single flight search cascade, path solver, LLM analyst, and sends result."""
@@ -508,6 +641,7 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
     baggage_needed = search_config.get("baggage_needed", 0)
     stopovers_pref = search_config.get("stopovers", [])
     exclusions = search_config.get("exclusions", [])
+    search_id = search_config.get("search_id")
     
     # Send initial status message to user (only if not a background monitoring job)
     status_msg = None
@@ -551,18 +685,40 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
     months_to_query.add(end_dt.strftime("%Y-%m"))
     months_list = list(months_to_query)
     
-    # Run dynamic bidirectional discovery
-    try:
-        candidate_edges = await discovery_service.discover_candidate_edges(
-            origin=origin,
-            destination_country=destination_country,
-            destination_iatas=destination_iatas,
-            months=months_list,
-            max_transfers=max_transfers
-        )
-    except Exception as e:
-        logger.error(f"Error in discovery service: {e}")
-        candidate_edges = set()
+    # Run dynamic bidirectional discovery, caching topology separately from prices.
+    discovery_cache_hit = False
+    candidate_edges = await asyncio.to_thread(
+        get_discovery_cache,
+        origin,
+        destination_country,
+        destination_iatas,
+        months_list,
+        max_transfers
+    )
+    if candidate_edges is not None:
+        discovery_cache_hit = True
+        logger.info(f"Discovery cache hit: {len(candidate_edges)} edges for {origin} -> {destination_country}")
+    else:
+        try:
+            candidate_edges = await discovery_service.discover_candidate_edges(
+                origin=origin,
+                destination_country=destination_country,
+                destination_iatas=destination_iatas,
+                months=months_list,
+                max_transfers=max_transfers
+            )
+            await asyncio.to_thread(
+                save_discovery_cache,
+                origin,
+                destination_country,
+                destination_iatas,
+                months_list,
+                max_transfers,
+                candidate_edges
+            )
+        except Exception as e:
+            logger.error(f"Error in discovery service: {e}")
+            candidate_edges = set()
         
     # If no candidate edges were discovered, fallback to static hubs so we don't return zero flights
     if not candidate_edges:
@@ -668,11 +824,28 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         "segments_count": len(candidate_edges),
         "priced_segments_count": len(priced_flights),
         "total_routes_found": solved_data.get("total_routes_found_before_filter", 0),
+        "total_routes_after_filter": solved_data.get("total_routes_after_filter", 0),
+        "rendered_routes_count": solved_data.get("rendered_routes_count", 0),
+        "discovery_cache_hit": discovery_cache_hit,
         "is_fallback_active": solved_data.get("is_fallback_active", False),
         "max_transfers": max_transfers,
         "destination_iatas": destination_iatas,
         "china_destinations": destination_iatas
     }
+
+    try:
+        snapshot_id = await asyncio.to_thread(
+            save_search_snapshot,
+            user_id,
+            search_id,
+            search_config,
+            metadata,
+            solved_data
+        )
+        metadata["snapshot_id"] = snapshot_id
+        logger.info(f"Saved search snapshot {snapshot_id} for user {user_id}, search {search_id}")
+    except Exception as e:
+        logger.error(f"Failed to save search snapshot: {e}")
     
     # LLM Cognitive Analysis
     date_range = f"{date_start} — {date_end}"
@@ -684,6 +857,13 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         solved_data=solved_data,
         search_metadata=metadata
     )
+    if solved_data.get("recommended"):
+        analysis_text += (
+            "\n\n📎 *Команды по результату:*"
+            "\n`/route R-XXXXXX` — детали маршрута"
+            "\n`/more_routes` — следующие 5 вариантов"
+            "\n`/routes_by_price` / `/routes_by_duration` — пересортировать сохраненный результат"
+        )
     
     # Delete status message before sending final report
     if status_msg:

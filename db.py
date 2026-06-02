@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import logging
+import hashlib
 from datetime import datetime, timezone, timedelta
 from config import DATABASE_PATH
 
@@ -242,6 +243,59 @@ def init_db():
         PRIMARY KEY (origin, destination)
     )
     """)
+
+    # 6. Search snapshots keep structured route results for /route and /more_routes.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS search_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        search_id INTEGER,
+        origin_iata TEXT NOT NULL,
+        destination_text TEXT NOT NULL,
+        date_start TEXT NOT NULL,
+        date_end TEXT NOT NULL,
+        metadata_json TEXT DEFAULT '{}',
+        solved_data_json TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(user_id),
+        FOREIGN KEY(search_id) REFERENCES user_searches(id)
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS route_snapshots (
+        snapshot_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        search_id INTEGER,
+        route_id TEXT NOT NULL,
+        route_rank INTEGER NOT NULL,
+        route_price REAL DEFAULT 0,
+        duration_hours REAL DEFAULT 0,
+        legs_count INTEGER DEFAULT 0,
+        risk_score REAL DEFAULT 0,
+        has_stopover INTEGER DEFAULT 0,
+        route_json TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (snapshot_id, route_id),
+        FOREIGN KEY(snapshot_id) REFERENCES search_snapshots(id)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_route_snapshots_user_route ON route_snapshots(user_id, route_id, snapshot_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_route_snapshots_user_search ON route_snapshots(user_id, search_id, snapshot_id)")
+
+    # 7. Discovery/topology cache. This caches candidate graph edges, not prices.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS route_discovery_cache (
+        origin TEXT NOT NULL,
+        destination_country TEXT NOT NULL,
+        destination_iatas_hash TEXT NOT NULL,
+        months_hash TEXT NOT NULL,
+        max_transfers INTEGER NOT NULL,
+        edges_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (origin, destination_country, destination_iatas_hash, months_hash, max_transfers)
+    )
+    """)
     
     conn.commit()
     
@@ -317,8 +371,10 @@ def save_user_search(user_id: int, origin_iata: str, destination_text: str, date
         max_transfers, visa_allowed, json.dumps(lodging_exceptions), max_budget,
         json.dumps(stopovers or []), json.dumps(exclusions or []), baggage_needed
     ))
+    search_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    return search_id
 
 def get_user_searches(user_id: int):
     conn = get_db_connection()
@@ -351,6 +407,191 @@ def update_last_checked_price(search_id: int, price: float):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE user_searches SET last_checked_price = ? WHERE id = ?", (price, search_id))
+    conn.commit()
+    conn.close()
+
+def _unique_routes_for_snapshot(solved_data: dict) -> list[dict]:
+    routes = []
+    seen = set()
+    for key in ("ranked_routes", "recommended", "cheapest", "fastest", "direct", "one_connection", "stopovers"):
+        for route in solved_data.get(key, []) or []:
+            route_id = route.get("route_id")
+            if not route_id or route_id in seen:
+                continue
+            seen.add(route_id)
+            routes.append(route)
+    return routes
+
+def save_search_snapshot(user_id: int, search_id: int | None, search_config: dict, metadata: dict, solved_data: dict) -> int:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO search_snapshots (
+        user_id, search_id, origin_iata, destination_text, date_start, date_end,
+        metadata_json, solved_data_json
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        search_id,
+        search_config.get("origin_iata", ""),
+        search_config.get("dest_iata", search_config.get("destination_text", "")),
+        search_config.get("date_start", ""),
+        search_config.get("date_end", ""),
+        json.dumps(metadata, ensure_ascii=False),
+        json.dumps(solved_data, ensure_ascii=False),
+    ))
+    snapshot_id = cursor.lastrowid
+
+    for rank, route in enumerate(_unique_routes_for_snapshot(solved_data), start=1):
+        segments = route.get("segments", [])
+        cursor.execute("""
+        INSERT OR REPLACE INTO route_snapshots (
+            snapshot_id, user_id, search_id, route_id, route_rank, route_price,
+            duration_hours, legs_count, risk_score, has_stopover, route_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            snapshot_id,
+            user_id,
+            search_id,
+            route.get("route_id"),
+            rank,
+            route.get("total_price", 0),
+            route.get("duration_hours", 0),
+            len(segments),
+            route.get("risk_score", 0),
+            1 if route.get("stopovers") else 0,
+            json.dumps(route, ensure_ascii=False),
+        ))
+
+    conn.commit()
+    conn.close()
+    return snapshot_id
+
+def get_latest_search_snapshot(user_id: int, search_id: int | None = None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if search_id:
+        cursor.execute("""
+        SELECT * FROM search_snapshots
+        WHERE user_id = ? AND search_id = ?
+        ORDER BY id DESC LIMIT 1
+        """, (user_id, search_id))
+    else:
+        cursor.execute("""
+        SELECT * FROM search_snapshots
+        WHERE user_id = ?
+        ORDER BY id DESC LIMIT 1
+        """, (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_route_snapshot(user_id: int, route_id: str, search_id: int | None = None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if search_id:
+        cursor.execute("""
+        SELECT rs.*, ss.metadata_json, ss.origin_iata, ss.destination_text, ss.date_start, ss.date_end
+        FROM route_snapshots rs
+        JOIN search_snapshots ss ON ss.id = rs.snapshot_id
+        WHERE rs.user_id = ? AND rs.search_id = ? AND upper(rs.route_id) = upper(?)
+        ORDER BY rs.snapshot_id DESC LIMIT 1
+        """, (user_id, search_id, route_id))
+    else:
+        cursor.execute("""
+        SELECT rs.*, ss.metadata_json, ss.origin_iata, ss.destination_text, ss.date_start, ss.date_end
+        FROM route_snapshots rs
+        JOIN search_snapshots ss ON ss.id = rs.snapshot_id
+        WHERE rs.user_id = ? AND upper(rs.route_id) = upper(?)
+        ORDER BY rs.snapshot_id DESC LIMIT 1
+        """, (user_id, route_id))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_snapshot_routes(user_id: int, search_id: int | None = None, offset: int = 0, limit: int = 5, sort_mode: str = "balanced"):
+    snapshot = get_latest_search_snapshot(user_id, search_id)
+    if not snapshot:
+        return None, []
+
+    order_by = {
+        "price": "route_price ASC, duration_hours ASC, route_rank ASC",
+        "duration": "duration_hours ASC, route_price ASC, route_rank ASC",
+        "comfort": "risk_score ASC, legs_count ASC, duration_hours ASC, route_price ASC",
+        "stopover": "has_stopover DESC, route_price ASC, duration_hours ASC, route_rank ASC",
+        "balanced": "route_rank ASC",
+    }.get(sort_mode, "route_rank ASC")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+    SELECT * FROM route_snapshots
+    WHERE snapshot_id = ?
+    ORDER BY {order_by}
+    LIMIT ? OFFSET ?
+    """, (snapshot["id"], limit, offset))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return snapshot, rows
+
+def _stable_hash(values: list[str]) -> str:
+    payload = json.dumps(sorted(values), ensure_ascii=False)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+def get_discovery_cache(origin: str, destination_country: str, destination_iatas: list[str], months: list[str],
+                        max_transfers: int, ttl_hours: int = 24) -> set[tuple[str, str]] | None:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT edges_json FROM route_discovery_cache
+    WHERE origin = ? AND destination_country = ?
+    AND destination_iatas_hash = ? AND months_hash = ?
+    AND max_transfers = ?
+    AND datetime(created_at) >= datetime('now', ?)
+    """, (
+        origin,
+        destination_country,
+        _stable_hash(destination_iatas),
+        _stable_hash(months),
+        max_transfers,
+        f"-{ttl_hours} hours",
+    ))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        edges = json.loads(row["edges_json"])
+        return {(str(origin), str(destination)) for origin, destination in edges}
+    except Exception:
+        return None
+
+def save_discovery_cache(origin: str, destination_country: str, destination_iatas: list[str], months: list[str],
+                         max_transfers: int, edges: set[tuple[str, str]]):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    edges_json = json.dumps(sorted([list(edge) for edge in edges]), ensure_ascii=False)
+    cursor.execute("""
+    INSERT INTO route_discovery_cache (
+        origin, destination_country, destination_iatas_hash, months_hash,
+        max_transfers, edges_json, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(origin, destination_country, destination_iatas_hash, months_hash, max_transfers) DO UPDATE SET
+        edges_json = excluded.edges_json,
+        created_at = excluded.created_at
+    """, (
+        origin,
+        destination_country,
+        _stable_hash(destination_iatas),
+        _stable_hash(months),
+        max_transfers,
+        edges_json,
+        created_at,
+    ))
     conn.commit()
     conn.close()
 

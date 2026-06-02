@@ -1,6 +1,8 @@
 import sqlite3
 import json
 import logging
+import hashlib
+import math
 from datetime import datetime, timezone, timedelta
 from db import get_db_connection
 
@@ -44,6 +46,24 @@ def is_stopover_allowed(city_iata, stopovers_pref, hubs):
     if hub_info and hub_info["city_name"].lower() in cleaned_prefs:
         return True
     return False
+
+def route_signature(route: list[dict]) -> str:
+    parts = []
+    for segment in route:
+        parts.append(
+            "|".join([
+                segment.get("origin", ""),
+                segment.get("destination", ""),
+                segment.get("departure_at", segment.get("depart_date", "")),
+                str(segment.get("price", "")),
+                "manual" if segment.get("is_manual") else "flight",
+            ])
+        )
+    return "||".join(parts)
+
+def route_id_for(route: list[dict]) -> str:
+    digest = hashlib.sha1(route_signature(route).encode("utf-8")).hexdigest()[:6].upper()
+    return f"R-{digest}"
 
 class GraphSolver:
     def __init__(self):
@@ -213,7 +233,8 @@ class GraphSolver:
                     last_duration = 5.0
             last_arrival = last_dept + timedelta(hours=last_duration)
             
-            total_duration_days = (last_arrival - first_dept).days + 1
+            duration_hours = max((last_arrival - first_dept).total_seconds() / 3600.0, 0.0)
+            total_duration_days = max(1, math.ceil(duration_hours / 24.0))
             
             # Check if timing is estimated due to missing duration (Codex C)
             estimated_timing = any((not s.get("is_manual") and s.get("duration", 0) == 0) for s in route)
@@ -275,15 +296,18 @@ class GraphSolver:
             total_price = base_price + lodging_price
             
             scored_routes.append({
+                "route_id": route_id_for(route),
                 "segments": route,
                 "base_price": base_price,
                 "lodging_price": lodging_price,
                 "total_price": total_price,
+                "duration_hours": duration_hours,
                 "duration_days": total_duration_days,
                 "stopovers": stopovers,
                 "risk_score": risk_score,
                 "risk_warnings": risk_warnings,
-                "estimated_timing": estimated_timing
+                "estimated_timing": estimated_timing,
+                "badges": []
             })
             
         # Split into within-budget and over-budget routes
@@ -307,16 +331,92 @@ class GraphSolver:
         cheapest_routes = sorted(target_routes, key=lambda x: x["total_price"])[:5]
         
         # 2. Fastest
-        fastest_routes = sorted(target_routes, key=lambda x: (x["duration_days"], x["total_price"]))[:5]
+        fastest_routes = sorted(target_routes, key=lambda x: (x["duration_hours"], x["total_price"]))[:5]
         
         # 3. Smart Stopovers (Must have at least one stopover of >= 2 days)
         stopover_routes = [r for r in target_routes if len(r["stopovers"]) > 0]
         stopover_routes = sorted(stopover_routes, key=lambda x: x["total_price"])[:5]
+
+        direct_routes = [r for r in target_routes if len(r["segments"]) == 1]
+        direct_routes = sorted(direct_routes, key=lambda x: (x["total_price"], x["duration_hours"]))[:5]
+
+        one_connection_routes = [r for r in target_routes if len(r["segments"]) == 2]
+        one_connection_routes = sorted(one_connection_routes, key=lambda x: (x["total_price"], x["duration_hours"]))[:5]
+
+        balanced_routes = sorted(
+            target_routes,
+            key=lambda x: (
+                x["risk_score"],
+                len(x["segments"]),
+                x["total_price"] + x["duration_hours"] * 350,
+                x["total_price"],
+            )
+        )
+
+        selected_by_signature = {}
+        recommended_routes = []
+
+        def add_from(routes, badge, count=1):
+            added = 0
+            for route in routes:
+                signature = route_signature(route["segments"])
+                if signature in selected_by_signature:
+                    existing = selected_by_signature[signature]
+                    if badge not in existing["badges"]:
+                        existing["badges"].append(badge)
+                    continue
+
+                if badge not in route["badges"]:
+                    route["badges"].append(badge)
+                recommended_routes.append(route)
+                selected_by_signature[signature] = route
+                added += 1
+                if added >= count:
+                    break
+
+        add_from(cheapest_routes, "Самый дешевый")
+        add_from(fastest_routes, "Самый быстрый")
+        add_from(direct_routes, "Прямой/короткий")
+        add_from(one_connection_routes, "До 1 пересадки")
+        add_from(stopover_routes, "Стоповер")
+        add_from(balanced_routes, "Баланс", count=max(0, 5 - len(recommended_routes)))
+        recommended_routes = recommended_routes[:5]
+
+        ranked_routes = []
+        ranked_seen = set()
+        for route in recommended_routes + balanced_routes + cheapest_routes + fastest_routes:
+            signature = route_signature(route["segments"])
+            if signature in ranked_seen:
+                continue
+            ranked_seen.add(signature)
+            ranked_routes.append(route)
+            if len(ranked_routes) >= 50:
+                break
+
+        omitted_routes = []
+        rendered_ids = {route["route_id"] for route in recommended_routes}
+        for route in ranked_routes:
+            if route["route_id"] in rendered_ids:
+                continue
+            omitted_routes.append({
+                "route_id": route["route_id"],
+                "reason": "not_in_top_5_diverse_summary",
+                "total_price": route["total_price"],
+                "duration_hours": route["duration_hours"],
+                "segments_count": len(route["segments"])
+            })
         
         return {
+            "recommended": recommended_routes,
+            "ranked_routes": ranked_routes,
             "cheapest": cheapest_routes,
             "fastest": fastest_routes,
+            "direct": direct_routes,
+            "one_connection": one_connection_routes,
             "stopovers": stopover_routes,
+            "omitted_routes": omitted_routes,
             "is_fallback_active": is_fallback_active,
-            "total_routes_found_before_filter": len(scored_routes)
+            "total_routes_found_before_filter": len(scored_routes),
+            "total_routes_after_filter": len(target_routes),
+            "rendered_routes_count": len(recommended_routes)
         }

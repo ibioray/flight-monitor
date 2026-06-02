@@ -16,6 +16,16 @@ def make_aviasales_link(origin: str, destination: str, date_str: str) -> str:
     except Exception:
         return "https://www.aviasales.ru"
 
+def format_duration_hours(hours: float) -> str:
+    total_minutes = int(round(hours * 60))
+    h = total_minutes // 60
+    m = total_minutes % 60
+    if h <= 0:
+        return f"{m} мин"
+    if m == 0:
+        return f"{h} ч"
+    return f"{h} ч {m} мин"
+
 class LLMCognitiveAnalyst:
     def __init__(self, api_key: str = GEMINI_API_KEY, openrouter_key: str = OPENROUTER_API_KEY):
         self.api_key = api_key
@@ -71,6 +81,9 @@ class LLMCognitiveAnalyst:
         Takes the categorized paths from GraphSolver, runs them through Gemini,
         and returns a beautiful, formatted Russian summary message.
         """
+        if solved_data.get("recommended"):
+            return self._generate_compact_analysis(solved_data, origin, destination, search_metadata)
+
         # Format the top categories to present to LLM
         cheapest_json = self.format_route_json(solved_data.get("cheapest", []))
         fastest_json = self.format_route_json(solved_data.get("fastest", []))
@@ -188,10 +201,10 @@ class LLMCognitiveAnalyst:
         
         is_fallback = solved_data.get("is_fallback_active", False)
         if is_fallback:
-            lines.append("⚠️ **Внимание: Билетов в рамках вашего бюджета не найдено!**")
+            lines.append("⚠️ *Внимание: билетов в рамках вашего бюджета не найдено!*")
             lines.append("Показываем лучшие найденные варианты с наименьшим превышением бюджета:\n")
         else:
-            lines.append("✈️ **Найденные варианты маршрутов:**\n")
+            lines.append("✈️ *Найденные варианты маршрутов:*\n")
         
         categories = [
             ("🌟 Самый дешевый", "cheapest"),
@@ -203,7 +216,7 @@ class LLMCognitiveAnalyst:
             routes = solved_data.get(key, [])
             if not routes:
                 continue
-            lines.append(f"### {name}:")
+            lines.append(f"*{name}:*")
             for index, r in enumerate(routes[:2]):
                 leg_desc = []
                 for leg in r["segments"]:
@@ -215,7 +228,7 @@ class LLMCognitiveAnalyst:
                         leg_desc.append(f"{leg['origin']} ➔ {leg['destination']} ({leg['depart_date']}, {leg['price']:,.0f} ₽, {transport})")
                         
                 chain = " ➔ ".join(leg_desc)
-                lines.append(f"{index+1}. **Итого: {r['total_price']:,.0f} ₽** (Билеты: {r['base_price']:,.0f} ₽, Жилье: {r['lodging_price']:,.0f} ₽)")
+                lines.append(f"{index+1}. *Итого: {r['total_price']:,.0f} ₽* (Билеты: {r['base_price']:,.0f} ₽, Жилье: {r['lodging_price']:,.0f} ₽)")
                 lines.append(f"   Маршрут: {chain}")
                 if r["risk_warnings"]:
                     lines.append(f"   ⚠️ *Риски:* {', '.join(r['risk_warnings'])}")
@@ -229,11 +242,78 @@ class LLMCognitiveAnalyst:
             dests = ", ".join(search_metadata.get("destination_iatas", search_metadata.get("china_destinations", [])))
             
             lines.append("---")
-            lines.append("🔍 **Прозрачность поиска:**")
+            lines.append("🔍 *Прозрачность поиска:*")
             lines.append(f"- Проверенные транзитные хабы: {hubs_list}")
             lines.append(f"- Выполнен двунаправленный поиск ({origin} ➔ {dests})")
             lines.append(f"- Кандидатных сегментов к проверке: {segments_count}")
             lines.append(f"- Priced-сегментов от API/кэша: {priced_segments_count}")
             lines.append(f"- Построено маршрутов: {total_routes}")
             
+        return "\n".join(lines)
+
+    def _generate_compact_analysis(self, solved_data: dict, origin: str = "", destination: str = "", search_metadata: dict = None) -> str:
+        """Deterministic compact renderer so selected routes cannot be omitted by LLM."""
+        routes = solved_data.get("recommended", [])
+        if not routes:
+            return self._generate_mock_analysis(solved_data, origin, destination, search_metadata)
+
+        lines = []
+        if solved_data.get("is_fallback_active"):
+            lines.append("⚠️ *В бюджете вариантов не нашлось.* Показываю ближайшие по цене.\n")
+        else:
+            lines.append("✈️ *Лучшие варианты*\n")
+
+        for index, route in enumerate(routes, start=1):
+            badges = route.get("badges") or []
+            badge_text = " / ".join(badges) if badges else "Вариант"
+            route_id = route.get("route_id", f"R-{index}")
+            total = f"{route['total_price']:,.0f}".replace(",", " ")
+            tickets = f"{route['base_price']:,.0f}".replace(",", " ")
+            lodging = f"{route['lodging_price']:,.0f}".replace(",", " ")
+            duration = format_duration_hours(route.get("duration_hours", 0))
+            legs_count = len(route.get("segments", []))
+
+            lines.append(f"{index}) [{route_id}] *{badge_text}*")
+            lines.append(f"Итого: {total} ₽ | билеты: {tickets} ₽ | жилье: {lodging} ₽")
+            lines.append(f"Время: {duration} | сегментов: {legs_count}")
+
+            leg_lines = []
+            for leg in route.get("segments", []):
+                transport = "поезд" if leg.get("is_manual") else "авиа"
+                price = f"{leg['price']:,.0f}".replace(",", " ")
+                date = leg.get("depart_date", leg.get("departure_at", "")[:10])
+                if leg.get("is_manual"):
+                    leg_lines.append(f"{leg['origin']} -> {leg['destination']} ({date}, {price} ₽, {transport})")
+                else:
+                    link = make_aviasales_link(leg["origin"], leg["destination"], date)
+                    leg_lines.append(f"{leg['origin']} -> {leg['destination']} ({date}, [{price} ₽]({link}), {transport})")
+            lines.append("Маршрут: " + " | ".join(leg_lines))
+
+            if route.get("stopovers"):
+                stopovers = ", ".join([f"{s['name']} {s['days']} дн." for s in route["stopovers"]])
+                lines.append(f"Стоповер: {stopovers}")
+            if route.get("estimated_timing"):
+                lines.append("Время части сегментов расчетное: перед покупкой обновить цены.")
+            if route.get("risk_warnings"):
+                lines.append("Риски: " + "; ".join(route["risk_warnings"][:2]))
+            lines.append("")
+
+        if search_metadata:
+            hubs_list = ", ".join(search_metadata.get("hubs", [])) or "нет транзитных хабов"
+            segments_count = search_metadata.get("segments_count", 0)
+            priced_segments_count = search_metadata.get("priced_segments_count", 0)
+            total_routes = search_metadata.get("total_routes_found", 0)
+            filtered_routes = search_metadata.get("total_routes_after_filter", solved_data.get("total_routes_after_filter", 0))
+            rendered = search_metadata.get("rendered_routes_count", solved_data.get("rendered_routes_count", len(routes)))
+            dests = ", ".join(search_metadata.get("destination_iatas", search_metadata.get("china_destinations", [])))
+            discovery_cache = "да" if search_metadata.get("discovery_cache_hit") else "нет"
+
+            lines.append("🔍 *Прозрачность поиска:*")
+            lines.append(f"Направления назначения: {dests}")
+            lines.append(f"Проверенные хабы: {hubs_list}")
+            lines.append(f"Discovery cache: {discovery_cache}")
+            lines.append(f"Кандидатных сегментов: {segments_count}")
+            lines.append(f"Priced-сегментов: {priced_segments_count}")
+            lines.append(f"Маршрутов найдено/после фильтров/показано: {total_routes}/{filtered_routes}/{rendered}")
+
         return "\n".join(lines)

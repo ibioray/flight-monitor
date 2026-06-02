@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -13,9 +14,14 @@ os.environ["DATABASE_PATH"] = TEST_DB_PATH
 import config
 config.DATABASE_PATH = TEST_DB_PATH
 
-from db import init_db, save_flight_cache
+from db import (
+    init_db, save_flight_cache, save_search_snapshot,
+    get_route_snapshot, get_snapshot_routes, save_discovery_cache,
+    get_discovery_cache
+)
 from solver import GraphSolver
 from analyst import LLMCognitiveAnalyst
+from discovery import RouteDiscoveryService
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("test_solver")
@@ -114,6 +120,32 @@ async def run_test():
     
     assert len(results["cheapest"]) > 0, "Error: Solver failed to find routes!"
     assert results["is_fallback_active"] is False, "Error: Fallback should not be active for 50,000 budget!"
+    assert results["fastest"][0]["segments"][0]["destination"] == "PEK", "Fastest route should be the direct UFA -> PEK route by hours."
+    assert any(len(r["segments"]) == 1 and r["segments"][0]["destination"] == "PEK" for r in results["recommended"]), "Direct route must be visible in recommended routes."
+    assert len(results["recommended"]) >= 5, "Recommended output should show at least 5 diverse routes when available."
+
+    # Regression: solver must ignore unrelated flights saved in the global DB cache
+    save_flight_cache("UFA", "CAN", "2026-06-19", "2026-06-19T09:00:00+05:00", 100.0, "XX", "LEAK", 0, 300, 1)
+    no_leak_results = solver.solve(
+        origin_iata=origin,
+        destination_country_code=destination_country,
+        destination_iatas=china_airports,
+        date_start_str=date_start,
+        date_end_str=date_end,
+        priced_flights=priced_flights,
+        max_transfers=3,
+        visa_allowed=1,
+        lodging_exceptions={"EVN": 0.0},
+        max_budget=max_budget,
+        baggage_needed=0,
+        stopovers_pref=[],
+        exclusions=[]
+    )
+    leaked = any(
+        any(leg["destination"] == "CAN" and leg.get("flight_number") == "LEAK" for leg in route["segments"])
+        for route in no_leak_results["recommended"]
+    )
+    assert not leaked, "Solver leaked a flight from global flight_cache into current-run results."
     
     # Print the cheapest path found
     best_route = results["cheapest"][0]
@@ -129,7 +161,9 @@ async def run_test():
         "hubs": ["MOW", "ALA", "EVN"],
         "segments_count": 12,
         "priced_segments_count": len(priced_flights),
-        "total_routes_found": 8,
+        "total_routes_found": results.get("total_routes_found_before_filter", 0),
+        "total_routes_after_filter": results.get("total_routes_after_filter", 0),
+        "rendered_routes_count": results.get("rendered_routes_count", 0),
         "is_fallback_active": results.get("is_fallback_active", False),
         "max_transfers": 3,
         "destination_iatas": china_airports
@@ -147,6 +181,36 @@ async def run_test():
     print("\n" + "=" * 40 + " STANDARD ANALYSIS REPORT " + "=" * 40)
     print(analysis_report)
     print("=" * 97 + "\n")
+
+    for route in results["recommended"]:
+        assert route["route_id"] in analysis_report, "Deterministic analysis must render every recommended route."
+
+    snapshot_id = save_search_snapshot(
+        user_id=42,
+        search_id=7,
+        search_config={
+            "origin_iata": origin,
+            "dest_iata": destination_country,
+            "date_start": date_start,
+            "date_end": date_end,
+        },
+        metadata=mock_metadata,
+        solved_data=results
+    )
+    assert snapshot_id > 0, "Search snapshot should be persisted."
+
+    first_route_id = results["recommended"][0]["route_id"]
+    route_row = get_route_snapshot(42, first_route_id)
+    assert route_row is not None, "Route snapshot should be retrievable by route_id."
+    assert json.loads(route_row["route_json"])["route_id"] == first_route_id
+
+    snapshot, price_rows = get_snapshot_routes(42, sort_mode="price")
+    assert snapshot is not None and len(price_rows) >= 5, "Snapshot routes should be pageable."
+    prices = [json.loads(row["route_json"])["total_price"] for row in price_rows]
+    assert prices == sorted(prices), "routes_by_price should sort by total price."
+
+    _, more_rows = get_snapshot_routes(42, offset=5, limit=5, sort_mode="balanced")
+    assert len(more_rows) > 0, "more_routes should return routes beyond the first page when available."
     
     # 5. Low Budget Fallback Test
     logger.info("Testing solver fallback for low budget (5,000 RUB)...")
@@ -173,6 +237,9 @@ async def run_test():
     # Analyze fallback results
     fallback_metadata = dict(mock_metadata)
     fallback_metadata["is_fallback_active"] = True
+    fallback_metadata["total_routes_found"] = fallback_results.get("total_routes_found_before_filter", 0)
+    fallback_metadata["total_routes_after_filter"] = fallback_results.get("total_routes_after_filter", 0)
+    fallback_metadata["rendered_routes_count"] = fallback_results.get("rendered_routes_count", 0)
     
     fallback_report = await analyst.analyze_routes(
         origin=origin,
@@ -186,6 +253,47 @@ async def run_test():
     print("\n" + "=" * 40 + " FALLBACK ANALYSIS REPORT " + "=" * 40)
     print(fallback_report)
     print("=" * 97 + "\n")
+
+    # 6. Discovery should not expand one proven backward hub to all destination airports
+    class FakeProvider:
+        async def get_outbound_directions(self, origin_code, month):
+            if origin_code == "UFA":
+                return [{"origin": "UFA", "destination": "ALA", "transfers": 0}]
+            return []
+
+        async def get_inbound_directions(self, destination_code, month):
+            if destination_code == "URC":
+                return [{"origin": "ALA", "destination": "URC", "transfers": 0}]
+            return []
+
+    discovery = RouteDiscoveryService(FakeProvider())
+    edges = await discovery.discover_candidate_edges(
+        origin="UFA",
+        destination_country="CN",
+        destination_iatas=["PEK", "PVG", "URC"],
+        months=["2026-06"],
+        max_transfers=1,
+    )
+    assert ("ALA", "URC") in edges, "Proven backward edge should be included."
+    assert ("ALA", "PEK") not in edges and ("ALA", "PVG") not in edges, "Backward hub must not be expanded to every destination airport."
+
+    save_discovery_cache(
+        origin="UFA",
+        destination_country="CN",
+        destination_iatas=["PEK", "PVG", "URC"],
+        months=["2026-06"],
+        max_transfers=1,
+        edges=edges
+    )
+    cached_edges = get_discovery_cache(
+        origin="UFA",
+        destination_country="CN",
+        destination_iatas=["URC", "PEK", "PVG"],
+        months=["2026-06"],
+        max_transfers=1,
+    )
+    assert cached_edges == edges, "Discovery cache should restore the same edge set with stable destination ordering."
+    assert get_discovery_cache("UFA", "CN", ["PEK", "PVG", "URC"], ["2026-06"], max_transfers=2) is None, "Discovery cache must be separated by max_transfers."
     
     # Clean up test DB after run
     if os.path.exists(TEST_DB_PATH):

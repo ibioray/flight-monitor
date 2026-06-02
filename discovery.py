@@ -20,22 +20,29 @@ class RouteDiscoveryService:
         
         # 1. Forward Discovery: Direct destinations from Origin
         forward_hubs = set()
+        forward_edges = set()
         for month in months:
             routes = await self.provider.get_outbound_directions(origin, month)
             for r in routes:
                 if r["transfers"] == 0:
-                    forward_hubs.add(r["destination"])
+                    dest = r["destination"]
+                    forward_hubs.add(dest)
+                    forward_edges.add((origin, dest))
                     
         logger.info(f"Forward discovery: found {len(forward_hubs)} direct destinations from {origin}")
         
         # 2. Backward Discovery: Direct origins to target destination airports
         backward_hubs = set()
+        backward_edges = set()
         for dest in destination_iatas:
             for month in months:
                 routes = await self.provider.get_inbound_directions(dest, month)
                 for r in routes:
                     if r["transfers"] == 0:
-                        backward_hubs.add(r["origin"])
+                        route_origin = r["origin"]
+                        route_dest = r["destination"]
+                        backward_hubs.add(route_origin)
+                        backward_edges.add((route_origin, route_dest))
                         
         logger.info(f"Backward discovery: found {len(backward_hubs)} direct origins to target destinations")
         
@@ -69,13 +76,11 @@ class RouteDiscoveryService:
             candidate_edges.add((origin, dest))
             
         # Direct flights: Origin -> Hub
-        for hub in forward_hubs:
-            candidate_edges.add((origin, hub))
+        candidate_edges.update(forward_edges)
             
-        # Direct flights: Hub -> Destination
-        for hub in backward_hubs:
-            for dest in destination_iatas:
-                candidate_edges.add((hub, dest))
+        # Direct flights: Hub -> specific destination airport proven by inbound discovery.
+        # Do not expand every backward hub to every target airport; that creates many empty API requests.
+        candidate_edges.update(backward_edges)
                 
         # 4. Explore connections between hubs
         # We query outbound directions from each hub in our pool
@@ -102,11 +107,8 @@ class RouteDiscoveryService:
             
             if can_reach_leg and can_reach_from_leg:
                 logger.info(f"Adding manual leg candidate: {leg_origin} -> {leg_dest}")
-                if leg_origin != origin and leg_origin not in forward_hubs:
-                    candidate_edges.add((origin, leg_origin))
-                if leg_dest not in destination_iatas and leg_dest not in backward_hubs:
-                    for dest in destination_iatas:
-                        candidate_edges.add((leg_dest, dest))
+                # Manual legs are loaded directly by the solver. Do not invent flight
+                # edges around them here; only provider-proven edges should be priced.
                         
         logger.info(f"Total unique candidate edges identified: {len(candidate_edges)}")
         return candidate_edges
