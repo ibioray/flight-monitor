@@ -47,6 +47,8 @@ def _rebuild_flight_cache(cursor):
         duration INTEGER DEFAULT 0,
         direct_only INTEGER DEFAULT 0,
         updated_at TEXT NOT NULL,
+        fetched_at TEXT,
+        expires_at TEXT,
         PRIMARY KEY (origin, destination, departure_at, direct_only)
     )
     """)
@@ -55,11 +57,14 @@ def _rebuild_flight_cache(cursor):
     flight_number_expr = "flight_number" if "flight_number" in existing_columns else "NULL"
     duration_expr = "duration" if "duration" in existing_columns else "0"
     direct_only_expr = "direct_only" if "direct_only" in existing_columns else "0"
+    fetched_at_expr = "fetched_at" if "fetched_at" in existing_columns else "NULL"
+    expires_at_expr = "expires_at" if "expires_at" in existing_columns else "NULL"
 
     cursor.execute(f"""
     INSERT OR REPLACE INTO flight_cache_new (
         origin, destination, depart_date, departure_at, price,
-        airline, flight_number, transfers_count, duration, direct_only, updated_at
+        airline, flight_number, transfers_count, duration, direct_only,
+        updated_at, fetched_at, expires_at
     )
     SELECT
         origin,
@@ -72,7 +77,9 @@ def _rebuild_flight_cache(cursor):
         transfers_count,
         {duration_expr},
         {direct_only_expr},
-        updated_at
+        updated_at,
+        {fetched_at_expr},
+        {expires_at_expr}
     FROM flight_cache
     """)
     cursor.execute("DROP TABLE flight_cache")
@@ -149,6 +156,8 @@ def init_db():
         max_budget INTEGER,
         is_active INTEGER DEFAULT 1,
         last_checked_price REAL DEFAULT 0,
+        last_checked_at TEXT,
+        price_drop_threshold_pct REAL DEFAULT 10,
         stopovers_json TEXT DEFAULT '[]',
         exclusions_json TEXT DEFAULT '[]',
         baggage_needed INTEGER DEFAULT 0,
@@ -161,6 +170,14 @@ def init_db():
     _add_column_if_missing(cursor, "user_searches", "stopovers_json", "stopovers_json TEXT DEFAULT '[]'")
     _add_column_if_missing(cursor, "user_searches", "exclusions_json", "exclusions_json TEXT DEFAULT '[]'")
     _add_column_if_missing(cursor, "user_searches", "baggage_needed", "baggage_needed INTEGER DEFAULT 0")
+    _add_column_if_missing(cursor, "user_searches", "last_checked_at", "last_checked_at TEXT")
+    _add_column_if_missing(cursor, "user_searches", "price_drop_threshold_pct", "price_drop_threshold_pct REAL DEFAULT 10")
+    _add_column_if_missing(cursor, "user_searches", "cache_mode", "cache_mode TEXT DEFAULT 'overview'")
+    _add_column_if_missing(cursor, "user_searches", "min_stopover_hours", "min_stopover_hours INTEGER DEFAULT 0")
+    _add_column_if_missing(cursor, "user_searches", "max_stopover_days", "max_stopover_days INTEGER DEFAULT 5")
+    _add_column_if_missing(cursor, "user_searches", "stopover_preset", "stopover_preset TEXT DEFAULT 'balanced'")
+    _add_column_if_missing(cursor, "user_searches", "allow_awkward_layovers", "allow_awkward_layovers INTEGER DEFAULT 1")
+    _add_column_if_missing(cursor, "user_searches", "visa_mode", "visa_mode TEXT DEFAULT 'visa_free_only'")
     
     # 3. Flight Cache Table
     cursor.execute("""
@@ -176,6 +193,8 @@ def init_db():
         duration INTEGER DEFAULT 0,
         direct_only INTEGER DEFAULT 0,
         updated_at TEXT NOT NULL,
+        fetched_at TEXT,
+        expires_at TEXT,
         PRIMARY KEY (origin, destination, departure_at, direct_only)
     )
     """)
@@ -193,6 +212,10 @@ def init_db():
         or flight_cache_pk != ["origin", "destination", "departure_at", "direct_only"]
     ):
         _rebuild_flight_cache(cursor)
+
+    # 3.1.1 Non-destructive column migrations for flight_cache
+    _add_column_if_missing(cursor, "flight_cache", "fetched_at", "fetched_at TEXT")
+    _add_column_if_missing(cursor, "flight_cache", "expires_at", "expires_at TEXT")
         
     # 3.2 Route Query Log Table (Codex D)
     cursor.execute("""
@@ -226,11 +249,13 @@ def init_db():
     CREATE TABLE IF NOT EXISTS transit_hubs (
         iata TEXT PRIMARY KEY,
         city_name TEXT NOT NULL,
+        country_code TEXT DEFAULT '',
         daily_lodging_rub REAL DEFAULT 0,
         requires_visa_for_ru INTEGER DEFAULT 0,
         passport_type_required TEXT DEFAULT 'internal' -- 'internal' or 'foreign'
     )
     """)
+    _add_column_if_missing(cursor, "transit_hubs", "country_code", "country_code TEXT DEFAULT ''")
     
     # 5. Manual Legs Table (trains, buses, etc.)
     cursor.execute("""
@@ -302,30 +327,44 @@ def init_db():
     # Seed default transit hubs
     default_hubs = [
         # Internal passport, visa-free
-        ("MOW", "Москва", 4000, 0, "internal"),
-        ("EVN", "Ереван", 0, 0, "internal"), # Custom request: 0 lodging cost for EVN
-        ("ALA", "Алматы", 3500, 0, "internal"),
-        ("NQZ", "Астана", 3500, 0, "internal"),
-        ("FRU", "Бишкек", 2500, 0, "internal"),
+        ("MOW", "Москва", "RU", 4000, 0, "internal"),
+        ("EVN", "Ереван", "AM", 0, 0, "internal"), # Custom request: 0 lodging cost for EVN
+        ("ALA", "Алматы", "KZ", 3500, 0, "internal"),
+        ("NQZ", "Астана", "KZ", 3500, 0, "internal"),
+        ("FRU", "Бишкек", "KG", 2500, 0, "internal"),
         
         # Russian hubs (internal passport)
-        ("SVX", "Екатеринбург", 3000, 0, "internal"),
-        ("KZN", "Казань", 3500, 0, "internal"),
-        ("OVB", "Новосибирск", 3000, 0, "internal"),
+        ("SVX", "Екатеринбург", "RU", 3000, 0, "internal"),
+        ("KZN", "Казань", "RU", 3500, 0, "internal"),
+        ("OVB", "Новосибирск", "RU", 3000, 0, "internal"),
         
         # Foreign passport, visa-free
-        ("TAS", "Ташкент", 3000, 0, "foreign"),
-        ("BAK", "Баку", 4000, 0, "foreign"),
-        ("IST", "Стамбул", 7000, 0, "foreign"),
-        ("DXB", "Дубай", 10000, 0, "foreign"),
-        ("AUH", "Абу-Даби", 8000, 0, "foreign"),
-        ("DOH", "Доха", 9000, 0, "foreign"),
+        ("TAS", "Ташкент", "UZ", 3000, 0, "foreign"),
+        ("BAK", "Баку", "AZ", 4000, 0, "foreign"),
+        ("IST", "Стамбул", "TR", 7000, 0, "foreign"),
+        ("DXB", "Дубай", "AE", 10000, 0, "foreign"),
+        ("AUH", "Абу-Даби", "AE", 8000, 0, "foreign"),
+        ("DOH", "Доха", "QA", 9000, 0, "foreign"),
+
+        # Known visa-risk examples for RU stopovers.
+        ("TYO", "Токио", "JP", 12000, 1, "foreign"),
+        ("HND", "Токио Ханэда", "JP", 12000, 1, "foreign"),
+        ("NRT", "Токио Нарита", "JP", 12000, 1, "foreign"),
+        ("LON", "Лондон", "GB", 14000, 1, "foreign"),
+        ("LHR", "Лондон Хитроу", "GB", 14000, 1, "foreign"),
+        ("JFK", "Нью-Йорк", "US", 16000, 1, "foreign"),
     ]
     
     for hub in default_hubs:
         cursor.execute("""
-        INSERT OR IGNORE INTO transit_hubs (iata, city_name, daily_lodging_rub, requires_visa_for_ru, passport_type_required)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO transit_hubs (iata, city_name, country_code, daily_lodging_rub, requires_visa_for_ru, passport_type_required)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(iata) DO UPDATE SET
+            city_name = excluded.city_name,
+            country_code = excluded.country_code,
+            daily_lodging_rub = excluded.daily_lodging_rub,
+            requires_visa_for_ru = excluded.requires_visa_for_ru,
+            passport_type_required = excluded.passport_type_required
         """, hub)
         
     # Seed default manual legs (popular cross-border segments)
@@ -356,20 +395,30 @@ def register_user(user_id: int, chat_id: int):
 
 def save_user_search(user_id: int, origin_iata: str, destination_text: str, date_start: str, date_end: str, 
                      max_transfers: int, visa_allowed: int, lodging_exceptions: dict, max_budget: int,
-                     stopovers: list = None, exclusions: list = None, baggage_needed: int = 0):
+                     stopovers: list = None, exclusions: list = None, baggage_needed: int = 0,
+                     cache_mode: str = "overview", min_stopover_hours: int = 0,
+                     max_stopover_days: int = 5, stopover_preset: str = "balanced",
+                     allow_awkward_layovers: int = 1, visa_mode: str = "visa_free_only",
+                     price_drop_threshold_pct: float = 10.0):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
     INSERT INTO user_searches (
         user_id, origin_iata, destination_text, date_start, date_end, 
         max_transfers, visa_allowed, lodging_exceptions_json, max_budget,
-        stopovers_json, exclusions_json, baggage_needed
+        stopovers_json, exclusions_json, baggage_needed,
+        price_drop_threshold_pct,
+        cache_mode, min_stopover_hours, max_stopover_days, stopover_preset,
+        allow_awkward_layovers, visa_mode
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id, origin_iata, destination_text, date_start, date_end, 
         max_transfers, visa_allowed, json.dumps(lodging_exceptions), max_budget,
-        json.dumps(stopovers or []), json.dumps(exclusions or []), baggage_needed
+        json.dumps(stopovers or []), json.dumps(exclusions or []), baggage_needed,
+        price_drop_threshold_pct,
+        cache_mode, min_stopover_hours, max_stopover_days, stopover_preset,
+        allow_awkward_layovers, visa_mode
     ))
     search_id = cursor.lastrowid
     conn.commit()
@@ -406,9 +455,26 @@ def get_all_active_searches():
 def update_last_checked_price(search_id: int, price: float):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE user_searches SET last_checked_price = ? WHERE id = ?", (price, search_id))
+    checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        "UPDATE user_searches SET last_checked_price = ?, last_checked_at = ? WHERE id = ?",
+        (price, checked_at, search_id)
+    )
     conn.commit()
     conn.close()
+
+def update_price_drop_threshold(search_id: int, user_id: int, threshold_pct: float) -> bool:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE user_searches
+    SET price_drop_threshold_pct = ?
+    WHERE id = ? AND user_id = ? AND is_active = 1
+    """, (threshold_pct, search_id, user_id))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
 
 def _unique_routes_for_snapshot(solved_data: dict) -> list[dict]:
     routes = []
@@ -614,6 +680,7 @@ def check_route_query_log(
     destination: str,
     month: str,
     direct_only: int,
+    ttl_hours: int = 24,
     one_way: int = QUERY_LOG_ONE_WAY,
     currency: str = QUERY_LOG_CURRENCY,
     market: str = QUERY_LOG_MARKET,
@@ -621,12 +688,12 @@ def check_route_query_log(
 ) -> bool:
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
+    cursor.execute(f"""
     SELECT 1 FROM route_query_log
     WHERE provider = ?
     AND origin = ? AND destination = ? AND month = ? AND direct_only = ?
     AND one_way = ? AND currency = ? AND market = ?
-    AND datetime(queried_at) >= datetime('now', '-24 hours')
+    AND datetime(queried_at) >= datetime('now', '-{int(ttl_hours)} hours')
     """, (provider, origin, destination, month, direct_only, one_way, currency, market))
     row = cursor.fetchone()
     conn.close()
@@ -677,16 +744,20 @@ def get_cached_flights(origin: str, destination: str, month: str, direct_only: i
     return [dict(r) for r in rows]
 
 def save_flight_cache(origin: str, destination: str, depart_date: str, departure_at: str, price: float, 
-                      airline: str, flight_number: str, transfers_count: int, duration: int, direct_only: int):
+                      airline: str, flight_number: str, transfers_count: int, duration: int, direct_only: int,
+                      fetched_at: str = None, expires_at: str = None):
     conn = get_db_connection()
     cursor = conn.cursor()
     updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    if fetched_at is None:
+        fetched_at = updated_at
     cursor.execute("""
     INSERT INTO flight_cache (
         origin, destination, depart_date, departure_at, price, 
-        airline, flight_number, transfers_count, duration, direct_only, updated_at
+        airline, flight_number, transfers_count, duration, direct_only,
+        updated_at, fetched_at, expires_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(origin, destination, departure_at, direct_only) DO UPDATE SET
         price = excluded.price,
         airline = excluded.airline,
@@ -694,8 +765,11 @@ def save_flight_cache(origin: str, destination: str, depart_date: str, departure
         transfers_count = excluded.transfers_count,
         duration = excluded.duration,
         direct_only = excluded.direct_only,
-        updated_at = excluded.updated_at
-    """, (origin, destination, depart_date, departure_at, price, airline, flight_number, transfers_count, duration, direct_only, updated_at))
+        updated_at = excluded.updated_at,
+        fetched_at = excluded.fetched_at,
+        expires_at = excluded.expires_at
+    """, (origin, destination, depart_date, departure_at, price, airline, flight_number,
+          transfers_count, duration, direct_only, updated_at, fetched_at, expires_at))
     conn.commit()
     conn.close()
 
@@ -715,6 +789,145 @@ def get_all_manual_legs():
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+def clear_price_cache_for_edges(edges: list[tuple[str, str]], months: list[str]):
+    """Удаляет записи flight_cache и route_query_log для указанных рёбер и месяцев."""
+    if not edges or not months:
+        return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        for origin, dest in edges:
+            for month in months:
+                cursor.execute("""
+                DELETE FROM flight_cache
+                WHERE origin = ? AND destination = ? AND depart_date LIKE ?
+                """, (origin, dest, f"{month}%"))
+                cursor.execute("""
+                DELETE FROM route_query_log
+                WHERE origin = ? AND destination = ? AND month = ?
+                """, (origin, dest, month))
+        conn.commit()
+        logger.info("Очищен кэш цен: %d рёбер × %d месяцев", len(edges), len(months))
+    finally:
+        conn.close()
+
+def get_cache_status_for_search(search_id: int, destination_iatas: list[str] = None,
+                                edges: list[tuple[str, str]] = None, months: list[str] = None,
+                                ttl_hours: int = 24) -> dict:
+    """Возвращает информацию о свежести кэша для поиска: общее число сегментов, устаревшие, старейший/новейший fetched_at."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM user_searches WHERE id = ?", (search_id,))
+        search = cursor.fetchone()
+        if not search:
+            return {"error": "search_not_found", "search_id": search_id}
+        search = dict(search)
+
+        origin = search["origin_iata"]
+        stopovers = json.loads(search.get("stopovers_json") or "[]")
+        dest = search["destination_text"]
+
+        if not destination_iatas:
+            dest_upper = dest.upper()
+            if len(dest_upper) == 3 and dest_upper.isalpha():
+                destination_iatas = [dest_upper]
+            else:
+                fallback_catalog = {
+                    "CN": ["PEK", "PKX", "PVG", "SHA", "CAN", "SZX", "CTU", "TFU", "URC", "XIY", "HGH", "HRB"],
+                    "TH": ["BKK", "DMK", "HKT", "CNX", "USM", "KBV"],
+                    "VN": ["HAN", "SGN", "DAD", "CXR", "PQC"],
+                    "TR": ["IST", "SAW", "AYT", "ESB", "ADB"],
+                    "AE": ["DXB", "AUH", "SHJ", "DWC"],
+                    "AM": ["EVN"],
+                    "KZ": ["ALA", "NQZ", "CIT", "SCO"],
+                    "UZ": ["TAS", "SKD", "BHK", "UGC"],
+                    "KG": ["FRU", "OSS"],
+                    "AZ": ["GYD"],
+                    "GE": ["TBS", "BUS", "KUT"],
+                    "JP": ["TYO", "HND", "NRT", "KIX", "ITM", "NGO", "FUK", "CTS", "OKA"],
+                    "KR": ["SEL", "ICN", "GMP", "PUS", "CJU"],
+                    "ID": ["CGK", "DPS", "SUB", "KNO", "UPG"],
+                    "MY": ["KUL", "PEN", "BKI", "KCH", "LGK"],
+                    "SG": ["SIN"],
+                }
+                destination_iatas = fallback_catalog.get(dest_upper, [dest_upper])
+
+        # Fallback edge reconstruction. Prefer passing real discovery/snapshot edges from bot.py.
+        if edges is None:
+            edges = []
+            if stopovers:
+                edges.append((origin, stopovers[0]))
+                for i in range(len(stopovers) - 1):
+                    edges.append((stopovers[i], stopovers[i + 1]))
+                for d_iata in destination_iatas:
+                    edges.append((stopovers[-1], d_iata))
+            else:
+                for d_iata in destination_iatas:
+                    edges.append((origin, d_iata))
+
+        # Определяем месяцы из диапазона дат
+        date_start = search["date_start"]
+        date_end = search["date_end"]
+        if months is None:
+            months = set()
+            try:
+                start_dt = datetime.strptime(date_start, "%Y-%m-%d")
+                end_dt = datetime.strptime(date_end, "%Y-%m-%d")
+                current = start_dt.replace(day=1)
+                while current <= end_dt:
+                    months.add(current.strftime("%Y-%m"))
+                    if current.month == 12:
+                        current = current.replace(year=current.year + 1, month=1)
+                    else:
+                        current = current.replace(month=current.month + 1)
+            except ValueError:
+                months = set()
+        else:
+            months = set(months)
+
+        if not edges or not months:
+            return {
+                "search_id": search_id,
+                "total_cached": 0,
+                "stale_count": 0,
+                "oldest_fetched_at": None,
+                "newest_fetched_at": None,
+            }
+
+        total_cached = 0
+        stale_count = 0
+        oldest = None
+        newest = None
+        stale_threshold = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+        for o, d in edges:
+            for month in months:
+                cursor.execute("""
+                SELECT fetched_at FROM flight_cache
+                WHERE origin = ? AND destination = ? AND depart_date LIKE ?
+                """, (o, d, f"{month}%"))
+                for row in cursor.fetchall():
+                    total_cached += 1
+                    fa = row["fetched_at"]
+                    if fa is None or fa < stale_threshold:
+                        stale_count += 1
+                    if fa is not None:
+                        if oldest is None or fa < oldest:
+                            oldest = fa
+                        if newest is None or fa > newest:
+                            newest = fa
+
+        return {
+            "search_id": search_id,
+            "total_cached": total_cached,
+            "stale_count": stale_count,
+            "oldest_fetched_at": oldest,
+            "newest_fetched_at": newest,
+        }
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     init_db()

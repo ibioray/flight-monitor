@@ -17,18 +17,19 @@ config.DATABASE_PATH = TEST_DB_PATH
 from db import (
     init_db, save_flight_cache, save_search_snapshot,
     get_route_snapshot, get_snapshot_routes, save_discovery_cache,
-    get_discovery_cache
+    get_discovery_cache, get_user_searches
 )
 from solver import GraphSolver
 from analyst import LLMCognitiveAnalyst
 from discovery import RouteDiscoveryService
+from monitoring import price_drop_alert_decision
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("test_solver")
 
 def populate_mock_data():
     logger.info("Seeding mock flight data for testing solver...")
-    
+
     # Format of segment in memory:
     # origin, destination, depart_date, departure_at, price, airline, flight_number, transfers_count, duration, direct_only
     flights = [
@@ -37,22 +38,22 @@ def populate_mock_data():
         ("UFA", "MOW", "2026-06-15", "2026-06-15T05:00:00+05:00", 5000.0, "SU", "123", 0, 180, 1),
         # MOW -> PEK departs June 17 at 12:00, arrives at 20:00 (duration 480 min). Price: 20000
         ("MOW", "PEK", "2026-06-17", "2026-06-17T12:00:00+03:00", 20000.0, "CA", "456", 0, 480, 1),
-        
+
         # Route 2: UFA -> ALA -> PEK (4 days stopover in Almaty)
         ("UFA", "ALA", "2026-06-16", "2026-06-16T10:00:00+06:00", 10000.0, "KC", "789", 0, 240, 1),
         ("ALA", "PEK", "2026-06-20", "2026-06-20T14:00:00+06:00", 15000.0, "KC", "987", 0, 360, 1),
-        
+
         # Route 3: UFA -> EVN -> PEK (3 days stopover in Yerevan, lodging cost = 0)
         ("UFA", "EVN", "2026-06-15", "2026-06-15T06:00:00+05:00", 8000.0, "RM", "111", 0, 240, 1),
         ("EVN", "PEK", "2026-06-18", "2026-06-18T11:00:00+04:00", 18000.0, "HU", "222", 0, 480, 1),
-        
+
         # Route 4: Direct flight UFA -> PEK
         ("UFA", "PEK", "2026-06-22", "2026-06-22T08:00:00+05:00", 45000.0, "CA", "333", 0, 420, 1),
-        
+
         # Leg for 3-hop transit: UFA -> MOW -> ALA -> PEK
         ("MOW", "ALA", "2026-06-16", "2026-06-16T22:00:00+03:00", 8000.0, "SU", "444", 0, 240, 1),
     ]
-    
+
     priced_flights = []
     for origin, dest, date, dep_at, price, airline, fn, transfers, duration, direct in flights:
         # Save to database cache to simulate cache seeding
@@ -69,7 +70,7 @@ def populate_mock_data():
             "transfers_count": transfers,
             "duration": duration
         })
-        
+
     logger.info("Mock flight data seeded successfully.")
     return priced_flights
 
@@ -77,24 +78,24 @@ async def run_test():
     # Clean old test DB if any
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
-        
+
     # 1. Init Database tables in isolated path (Codex I)
     init_db()
-    
+
     # 2. Populate DB and construct in-memory priced_flights
     priced_flights = populate_mock_data()
-    
+
     # 3. Solver test
     logger.info("Initializing GraphSolver...")
     solver = GraphSolver()
-    
+
     origin = "UFA"
     destination_country = "CN"
     china_airports = ["PEK", "PVG", "CAN", "CTU", "URC"]
     date_start = "2026-06-15"
     date_end = "2026-06-30"
     max_budget = 50000.0
-    
+
     logger.info("Solving route graph...")
     # Solver receives priced_flights directly in memory (Codex E)
     results = solver.solve(
@@ -112,12 +113,12 @@ async def run_test():
         stopovers_pref=[],
         exclusions=[]
     )
-    
+
     # Validate result structure
     logger.info(f"Solved cheapest routes count: {len(results['cheapest'])}")
     logger.info(f"Solved fastest routes count: {len(results['fastest'])}")
     logger.info(f"Solved stopover routes count: {len(results['stopovers'])}")
-    
+
     assert len(results["cheapest"]) > 0, "Error: Solver failed to find routes!"
     assert results["is_fallback_active"] is False, "Error: Fallback should not be active for 50,000 budget!"
     assert results["fastest"][0]["segments"][0]["destination"] == "PEK", "Fastest route should be the direct UFA -> PEK route by hours."
@@ -146,17 +147,17 @@ async def run_test():
         for route in no_leak_results["recommended"]
     )
     assert not leaked, "Solver leaked a flight from global flight_cache into current-run results."
-    
+
     # Print the cheapest path found
     best_route = results["cheapest"][0]
     chain = " ➔ ".join([f"{leg['origin']} -> {leg['destination']} ({leg['departure_at']}, {leg['price']:.0f} ₽)" for leg in best_route["segments"]])
     logger.info(f"Best cheapest route (Total Cost: {best_route['total_price']:.0f} ₽, Tickets: {best_route['base_price']:.0f} ₽, Lodging: {best_route['lodging_price']:.0f} ₽):")
     logger.info(f"  {chain}")
-    
+
     # 4. LLM Analyst test with search metadata (Force mock mode to isolate test, DOP-6)
     logger.info("Testing LLMCognitiveAnalyst in mock mode (no network requests)...")
     analyst = LLMCognitiveAnalyst(api_key="your_gemini_api_key_here", openrouter_key="")
-    
+
     mock_metadata = {
         "hubs": ["MOW", "ALA", "EVN"],
         "segments_count": 12,
@@ -168,7 +169,7 @@ async def run_test():
         "max_transfers": 3,
         "destination_iatas": china_airports
     }
-    
+
     analysis_report = await analyst.analyze_routes(
         origin=origin,
         destination=destination_country,
@@ -177,13 +178,25 @@ async def run_test():
         solved_data=results,
         search_metadata=mock_metadata
     )
-    
+
     print("\n" + "=" * 40 + " STANDARD ANALYSIS REPORT " + "=" * 40)
     print(analysis_report)
     print("=" * 97 + "\n")
 
     for route in results["recommended"]:
         assert route["route_id"] in analysis_report, "Deterministic analysis must render every recommended route."
+    assert "###" not in analysis_report and "**" not in analysis_report, "Telegram report must not use headings or double-star Markdown."
+
+    renderer_probe = dict(results["recommended"][0])
+    renderer_probe["badges"] = ["Тест ## badge"]
+    renderer_probe["risk_warnings"] = ["Риск **markdown** #tag"]
+    rendered_probe = analyst.renderer.render_summary(
+        {"recommended": [renderer_probe], "is_fallback_active": False},
+        {"destination_iatas": china_airports, "hubs": ["MOW"], "visa_mode": "warn"}
+    )
+    assert "#" not in rendered_probe, "Renderer must sanitize heading/hash characters from dynamic content."
+    assert "**" not in rendered_probe, "Renderer must sanitize double-star Markdown from dynamic content."
+    assert renderer_probe["route_id"] in rendered_probe, "Renderer must preserve route_id."
 
     snapshot_id = save_search_snapshot(
         user_id=42,
@@ -211,7 +224,7 @@ async def run_test():
 
     _, more_rows = get_snapshot_routes(42, offset=5, limit=5, sort_mode="balanced")
     assert len(more_rows) > 0, "more_routes should return routes beyond the first page when available."
-    
+
     # 5. Low Budget Fallback Test
     logger.info("Testing solver fallback for low budget (5,000 RUB)...")
     fallback_results = solver.solve(
@@ -229,18 +242,18 @@ async def run_test():
         stopovers_pref=[],
         exclusions=[]
     )
-    
+
     assert fallback_results["is_fallback_active"] is True, "Error: Fallback should be active for low budget!"
     logger.info(f"Fallback active: {fallback_results['is_fallback_active']}")
     logger.info(f"Routes found in fallback: {len(fallback_results['cheapest'])}")
-    
+
     # Analyze fallback results
     fallback_metadata = dict(mock_metadata)
     fallback_metadata["is_fallback_active"] = True
     fallback_metadata["total_routes_found"] = fallback_results.get("total_routes_found_before_filter", 0)
     fallback_metadata["total_routes_after_filter"] = fallback_results.get("total_routes_after_filter", 0)
     fallback_metadata["rendered_routes_count"] = fallback_results.get("rendered_routes_count", 0)
-    
+
     fallback_report = await analyst.analyze_routes(
         origin=origin,
         destination=destination_country,
@@ -249,7 +262,7 @@ async def run_test():
         solved_data=fallback_results,
         search_metadata=fallback_metadata
     )
-    
+
     print("\n" + "=" * 40 + " FALLBACK ANALYSIS REPORT " + "=" * 40)
     print(fallback_report)
     print("=" * 97 + "\n")
@@ -294,11 +307,234 @@ async def run_test():
     )
     assert cached_edges == edges, "Discovery cache should restore the same edge set with stable destination ordering."
     assert get_discovery_cache("UFA", "CN", ["PEK", "PVG", "URC"], ["2026-06"], max_transfers=2) is None, "Discovery cache must be separated by max_transfers."
-    
+
+    # 7. Rate Limiter Test
+    logger.info("Testing AsyncRateLimiter...")
+    from providers import AsyncRateLimiter
+    limiter = AsyncRateLimiter(target_rps=10.0, burst=2)
+    start_time = asyncio.get_event_loop().time()
+    for _ in range(5):
+        await limiter.acquire()
+        limiter.release()
+    end_time = asyncio.get_event_loop().time()
+    elapsed = end_time - start_time
+    logger.info(f"Rate Limiter elapsed time for 5 acquires: {elapsed:.2f}s")
+    assert elapsed >= 0.2, f"Rate limiter failed to delay. Elapsed: {elapsed}"
+
+    # 8. Cache Freshness Round-trip and Mode Test
+    logger.info("Testing Cache Freshness and Modes...")
+    from db import get_cache_status_for_search, save_user_search, get_cached_flights
+
+    fetched_at = "2026-06-03 00:00:00"
+    expires_at = "2026-06-04 00:00:00"
+    save_flight_cache(
+        origin="UFA",
+        destination="MOW",
+        depart_date="2026-06-15",
+        departure_at="2026-06-15T05:00:00+05:00",
+        price=5000.0,
+        airline="SU",
+        flight_number="123",
+        transfers_count=0,
+        duration=180,
+        direct_only=1,
+        fetched_at=fetched_at,
+        expires_at=expires_at
+    )
+
+    cached = get_cached_flights("UFA", "MOW", "2026-06", direct_only=1)
+    assert len(cached) > 0
+    assert cached[0]["fetched_at"] == fetched_at
+    assert cached[0]["expires_at"] == expires_at
+
+    search_id_overview = save_user_search(
+        user_id=42, origin_iata="UFA", destination_text="CN", date_start="2026-06-15", date_end="2026-06-30",
+        max_transfers=2, visa_allowed=1, lodging_exceptions={}, max_budget=50000,
+        stopovers=["MOW"], exclusions=[], baggage_needed=0,
+        cache_mode="overview",
+        min_stopover_hours=24,
+        max_stopover_days=3,
+        stopover_preset="walk",
+        allow_awkward_layovers=0,
+        visa_mode="visa_free_only"
+    )
+    saved_search = [s for s in get_user_searches(42) if s["id"] == search_id_overview][0]
+    assert saved_search["stopover_preset"] == "walk"
+    assert saved_search["min_stopover_hours"] == 24
+    assert saved_search["max_stopover_days"] == 3
+    assert saved_search["allow_awkward_layovers"] == 0
+    assert saved_search["visa_mode"] == "visa_free_only"
+    assert float(saved_search["price_drop_threshold_pct"]) == 10.0
+
+    status = get_cache_status_for_search(search_id_overview, ["PEK"])
+    assert status["total_cached"] > 0
+    logger.info(f"Cache status retrieved: {status}")
+
+    # 9. Stopover Presets and Filtering Test
+    logger.info("Testing Stopover Presets and Filtering...")
+    fast_results = solver.solve(
+        origin_iata=origin,
+        destination_country_code=destination_country,
+        destination_iatas=china_airports,
+        date_start_str=date_start,
+        date_end_str=date_end,
+        priced_flights=priced_flights,
+        max_transfers=3,
+        visa_allowed=1,
+        max_budget=max_budget,
+        stopover_preset="fast"
+    )
+    for route in fast_results["recommended"]:
+        for stop in route["stopovers"]:
+            if stop["city"] == "MOW":
+                assert stop["layover_hours"] <= 24.0, f"Route with >24h stopover {stop['layover_hours']} allowed in fast preset."
+            assert stop["layover_type"] != "awkward", "Fast preset must filter awkward layovers."
+
+    walk_results = solver.solve(
+        origin_iata=origin,
+        destination_country_code=destination_country,
+        destination_iatas=china_airports,
+        date_start_str=date_start,
+        date_end_str=date_end,
+        priced_flights=priced_flights,
+        max_transfers=3,
+        visa_allowed=1,
+        max_budget=max_budget,
+        stopover_preset="walk"
+    )
+    for route in walk_results["stopovers"]:
+        has_valid_layover = any(stop["layover_hours"] >= 24.0 for stop in route["stopovers"])
+        assert has_valid_layover, "Stopover route without >=24h layover returned under 'walk' preset."
+        assert all(stop["layover_type"] != "awkward" for stop in route["stopovers"]), "Walk preset must filter awkward layovers."
+
+    strict_results = solver.solve(
+        origin_iata=origin,
+        destination_country_code=destination_country,
+        destination_iatas=china_airports,
+        date_start_str=date_start,
+        date_end_str=date_end,
+        priced_flights=priced_flights,
+        max_transfers=3,
+        visa_allowed=1,
+        max_budget=max_budget,
+        allow_awkward_layovers=0
+    )
+    for route in strict_results["ranked_routes"]:
+        assert all(stop["layover_type"] != "awkward" for stop in route["stopovers"]), "Explicit awkward layover ban must filter all awkward routes."
+
+    # 10. Visa mode and country-code blacklist test
+    logger.info("Testing Visa Mode and Country Exclusions...")
+    visa_flights = list(priced_flights) + [
+        {
+            "origin": "UFA",
+            "destination": "TYO",
+            "depart_date": "2026-06-15",
+            "departure_at": "2026-06-15T08:00:00+05:00",
+            "price": 6000.0,
+            "airline": "JL",
+            "flight_number": "VISA1",
+            "transfers_count": 0,
+            "duration": 600
+        },
+        {
+            "origin": "TYO",
+            "destination": "PEK",
+            "depart_date": "2026-06-16",
+            "departure_at": "2026-06-16T18:00:00+09:00",
+            "price": 6000.0,
+            "airline": "JL",
+            "flight_number": "VISA2",
+            "transfers_count": 0,
+            "duration": 240
+        },
+    ]
+    visa_free_results = solver.solve(
+        origin_iata=origin,
+        destination_country_code=destination_country,
+        destination_iatas=china_airports,
+        date_start_str=date_start,
+        date_end_str=date_end,
+        priced_flights=visa_flights,
+        max_transfers=2,
+        visa_allowed=0,
+        max_budget=100000,
+        visa_mode="visa_free_only"
+    )
+    assert not any(
+        any(leg["origin"] == "TYO" or leg["destination"] == "TYO" for leg in route["segments"])
+        for route in visa_free_results["ranked_routes"]
+    ), "visa_free_only must filter known visa-required transit hubs."
+
+    warn_results = solver.solve(
+        origin_iata=origin,
+        destination_country_code=destination_country,
+        destination_iatas=china_airports,
+        date_start_str=date_start,
+        date_end_str=date_end,
+        priced_flights=visa_flights,
+        max_transfers=2,
+        visa_allowed=1,
+        max_budget=100000,
+        visa_mode="warn"
+    )
+    visa_warning_routes = [
+        route for route in warn_results["ranked_routes"]
+        if any("Визовый риск" in warning for warning in route["risk_warnings"])
+    ]
+    assert visa_warning_routes, "warn visa mode should keep visa-risk routes and add visible warnings."
+
+    excluded_country_results = solver.solve(
+        origin_iata=origin,
+        destination_country_code=destination_country,
+        destination_iatas=china_airports,
+        date_start_str=date_start,
+        date_end_str=date_end,
+        priced_flights=visa_flights,
+        max_transfers=2,
+        visa_allowed=1,
+        max_budget=100000,
+        visa_mode="ignore",
+        exclusions=["JP"]
+    )
+    assert not any(
+        any(leg["origin"] == "TYO" or leg["destination"] == "TYO" for leg in route["segments"])
+        for route in excluded_country_results["ranked_routes"]
+    ), "Country-code exclusions should remove transit hubs in that country."
+
+    # 11. Price-drop monitoring decision test
+    logger.info("Testing price-drop monitoring decisions...")
+    alert_decision = price_drop_alert_decision(last_price=50000, current_price=45500, threshold_pct=8)
+    assert alert_decision["should_alert"], "A 9% drop should alert when threshold is 8%."
+    assert alert_decision["should_update_baseline"], "Complete monitoring data should update the baseline."
+
+    # Audit H2: a sub-threshold drop must NOT ratchet the baseline down, otherwise a
+    # slow decline (e.g. 5%+5%+5%) would never cross the alert threshold.
+    small_drop_decision = price_drop_alert_decision(last_price=50000, current_price=47500, threshold_pct=8)
+    assert not small_drop_decision["should_alert"], "A 5% drop should not alert when threshold is 8%."
+    assert not small_drop_decision["should_update_baseline"], "Sub-threshold drops must keep the old baseline (no ratchet)."
+
+    # Cumulative drop: starting from the same 50000 baseline, a later price that is
+    # 11% lower must alert even though it would not relative to an intermediate low.
+    cumulative_decision = price_drop_alert_decision(last_price=50000, current_price=44500, threshold_pct=8)
+    assert cumulative_decision["should_alert"], "A cumulative 11% drop vs the kept baseline should alert."
+
+    # A price increase should update the baseline up (track the peak) but not alert.
+    price_up_decision = price_drop_alert_decision(last_price=50000, current_price=55000, threshold_pct=8)
+    assert not price_up_decision["should_alert"], "A price increase must not alert."
+    assert price_up_decision["should_update_baseline"], "A price increase should move the baseline up to the new peak."
+
+    partial_decision = price_drop_alert_decision(last_price=50000, current_price=40000, threshold_pct=8, partial_data=True)
+    assert not partial_decision["should_alert"], "Partial API data must not trigger a price alert."
+    assert not partial_decision["should_update_baseline"], "Partial API data must not overwrite baseline."
+
+    first_baseline_decision = price_drop_alert_decision(last_price=0, current_price=50000, threshold_pct=8)
+    assert not first_baseline_decision["should_alert"], "First observed price should create baseline silently."
+    assert first_baseline_decision["should_update_baseline"], "First valid price should be stored as baseline."
+
     # Clean up test DB after run
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
-        
+
     logger.info("Test finished successfully!")
 
 if __name__ == "__main__":
