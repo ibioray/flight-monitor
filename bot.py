@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -48,6 +48,15 @@ provider = TravelpayoutsProvider()
 solver = GraphSolver()
 analyst = LLMCognitiveAnalyst()
 discovery_service = RouteDiscoveryService(provider)
+
+# Curator list of top airports for common countries (Codex B)
+COUNTRY_AIRPORTS = {
+    "CN": ["PEK", "PKX", "PVG", "SHA", "CAN", "SZX", "CTU", "TFU", "URC", "XIY", "HGH", "HRB"],
+    "TH": ["BKK", "DMK", "HKT", "CNX", "USM", "KBV"],
+    "VN": ["HAN", "SGN", "DAD", "CXR", "PQC"],
+    "TR": ["IST", "SAW", "AYT", "ESB", "ADB"],
+    "AE": ["DXB", "AUH", "SHJ", "DWC"]
+}
 
 # Helpers for dynamic LLM Parsing
 async def call_llm(prompt: str) -> str:
@@ -111,6 +120,35 @@ async def parse_location_with_llm(text: str, is_country: bool = False) -> dict:
         return {"iata": "CN" if "кит" in text.lower() else text.upper()[:2], "resolved_name": text}
     return {"iata": "UFA" if "уф" in text.lower() else text.upper()[:3], "resolved_name": text}
 
+async def get_airports_for_country_with_llm(country_code: str) -> list[str]:
+    """Uses LLM to resolve country code to top 5-8 airport IATA codes in that country (Codex B)."""
+    prompt = f"""
+Напиши список из 5-8 крупнейших международных аэропортов (IATA коды) для страны с кодом {country_code}.
+Ответь строго в формате JSON списка строк, без какого-либо дополнительного текста, например:
+["BKK", "DMK", "HKT", "CNX", "UTP"]
+"""
+    resp_text = await call_llm(prompt)
+    if resp_text:
+        try:
+            cleaned = resp_text.strip().replace("```json", "").replace("```", "")
+            return json.loads(cleaned)
+        except Exception as e:
+            logger.error(f"Failed to parse LLM airports response JSON: {e}. Raw response: {resp_text}")
+    return [country_code] # fallback
+
+async def resolve_destination_airports(country_code: str) -> list[str]:
+    """Returns top airport IATA codes for a country using deterministic catalog first (Codex B)."""
+    code = country_code.upper()
+    if code in COUNTRY_AIRPORTS:
+        logger.info(f"Resolved airports for {code} deterministically: {COUNTRY_AIRPORTS[code]}")
+        return COUNTRY_AIRPORTS[code]
+    
+    # LLM fallback
+    logger.info(f"Resolving airports for {code} dynamically via LLM...")
+    resolved = await get_airports_for_country_with_llm(code)
+    logger.info(f"LLM resolved airports for {code}: {resolved}")
+    return resolved
+
 async def parse_dates_with_llm(text: str) -> dict:
     """Uses LLM to resolve flexible date strings to concrete YYYY-MM-DD ranges."""
     current_year = datetime.now().year
@@ -141,10 +179,39 @@ async def parse_dates_with_llm(text: str) -> dict:
         "desc": text
     }
 
+async def send_message_safely(chat_id: int, text: str):
+    """Sends long messages safely, splitting by newlines and falling back to plain text if Markdown fails (DOP-4)."""
+    chunks = []
+    current_chunk = []
+    current_len = 0
+    
+    for line in text.split("\n"):
+        if current_len + len(line) + 1 > 4000:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = [line]
+            current_len = len(line)
+        else:
+            current_chunk.append(line)
+            current_len += len(line) + 1
+            
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+        
+    for chunk in chunks:
+        try:
+            await bot.send_message(chat_id, chunk, parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as e:
+            logger.error(f"Markdown send failed: {e}. Falling back to plain text.")
+            try:
+                # Fallback without parse_mode
+                await bot.send_message(chat_id, chunk, disable_web_page_preview=True)
+            except Exception as e2:
+                logger.error(f"Plain text send failed as well: {e2}")
+
 # Command Handlers
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
-    register_user(message.from_user.id, message.chat.id)
+    await asyncio.to_thread(register_user, message.from_user.id, message.chat.id)
     welcome_text = (
         "👋 Привет! Я умный бот-маршрутизатор билетов.\n\n"
         "Я умею искать хитрые каскадные маршруты с пересадками и стоповерами (остановками в городах на 2-5 дней), "
@@ -165,10 +232,10 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 # Search Wizard Implementation
 @router.message(Command("new_search", "newsearch"))
 async def cmd_new_search(message: types.Message, state: FSMContext):
-    register_user(message.from_user.id, message.chat.id)
+    await asyncio.to_thread(register_user, message.from_user.id, message.chat.id)
     await state.clear()
     await state.set_state(SearchWizard.waiting_for_origin)
-    await message.answer("🏙️ **Шаг 1 из 7:** Откуда летим?\nНапишите название города (например, Уфа) или его IATA-код (UFA):")
+    await message.answer("🏙️ **Шаг 1 из 8:** Откуда летим?\nНапишите название города (например, Уфа) или его IATA-код (UFA):")
 
 @router.message(SearchWizard.waiting_for_origin)
 async def process_origin(message: types.Message, state: FSMContext):
@@ -181,7 +248,7 @@ async def process_origin(message: types.Message, state: FSMContext):
     await state.set_state(SearchWizard.waiting_for_destination)
     await message.answer(
         f"✅ Город отправления определен как: **{resolved.get('resolved_name', origin_text)} ({resolved['iata']})**\n\n"
-        f"🌏 **Шаг 2 из 7:** Куда летим?\nНапишите название страны назначения (например, Китай, Вьетнам, Таиланд) или код IATA:"
+        f"🌏 **Шаг 2 из 8:** Куда летим?\nНапишите название страны назначения (например, Китай, Вьетнам, Таиланд) или код IATA:"
     )
 
 @router.message(SearchWizard.waiting_for_destination)
@@ -195,7 +262,7 @@ async def process_destination(message: types.Message, state: FSMContext):
     await state.set_state(SearchWizard.waiting_for_dates)
     await message.answer(
         f"✅ Страна назначения определена как: **{resolved.get('resolved_name', dest_text)} ({resolved['iata']})**\n\n"
-        f"📅 **Шаг 3 из 7:** Когда летим?\nНапишите дату или диапазон человеческим языком (например, *середина июня*, *ближайшие 2 недели*, *с 15 по 30 июня 2026*):"
+        f"📅 **Шаг 3 из 8:** Когда летим?\nНапишите дату или диапазон человеческим языком (например, *середина июня*, *ближайшие 2 недели*, *с 15 по 30 июня 2026*):"
     )
 
 @router.message(SearchWizard.waiting_for_dates)
@@ -213,16 +280,14 @@ async def process_dates(message: types.Message, state: FSMContext):
     await state.set_state(SearchWizard.waiting_for_budget)
     await message.answer(
         f"✅ Диапазон дат определен как: **{resolved['date_start']} — {resolved['date_end']} ({resolved['desc']})**\n\n"
-        f"💰 **Шаг 4 из 7:** Максимальный бюджет?\nВведите максимальную стоимость билетов в рублях (например, 50000):"
+        f"💰 **Шаг 4 из 8:** Максимальный бюджет?\nВведите максимальную стоимость билетов в рублях (например, 50000, 50к, 20 тысяч):"
     )
 
 def parse_budget(text: str) -> int | None:
     import re
-    # 1. Clean whitespace, lowercase and normalize commas to dots
     cleaned = text.lower().strip().replace("\xa0", "").replace(" ", "")
     cleaned = cleaned.replace(",", ".")
     
-    # 2. Check for numeric values with k/к/тыс/тысяч/т multipliers
     match_multiplier = re.match(r"^(\d+(?:\.\d+)?)(?:к|k|тыс|тысяч|т)", cleaned)
     if match_multiplier:
         try:
@@ -231,7 +296,6 @@ def parse_budget(text: str) -> int | None:
         except ValueError:
             pass
             
-    # 3. Clean up non-digits to get just the number part if it is at the beginning (e.g. 20000рублей -> 20000)
     match_digits = re.match(r"^(\d+)", cleaned)
     if match_digits:
         try:
@@ -257,7 +321,7 @@ async def process_budget(message: types.Message, state: FSMContext):
     kb.adjust(2)
     
     await message.answer(
-        "🎒 **Шаг 5 из 7:** Нужен ли багаж?\nЭто влияет на риски при самостоятельных пересадках (короткие стыки не пройдут с багажом):",
+        "🎒 **Шаг 5 из 8:** Нужен ли багаж?\nЭто влияет на риски при самостоятельных пересадках (короткие стыки не пройдут с багажом):",
         reply_markup=kb.as_markup(resize_keyboard=True, one_time_keyboard=True)
     )
 
@@ -329,17 +393,21 @@ async def process_exclusions(message: types.Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
     
-    # Save search preferences in DB
-    save_user_search(
+    # Save search preferences in DB (DOP-1 / async-safe thread)
+    await asyncio.to_thread(
+        save_user_search,
         user_id=message.from_user.id,
         origin_iata=data["origin_iata"],
-        destination_text=data["dest_iata"],  # Using country code or resolved destination
+        destination_text=data["dest_iata"],
         date_start=data["date_start"],
         date_end=data["date_end"],
         max_transfers=data["max_transfers"],
-        visa_allowed=1,  # Default to allowed, user can toggle in settings later
-        lodging_exceptions={},  # Can be expanded
-        max_budget=data["max_budget"]
+        visa_allowed=1,
+        lodging_exceptions={},
+        max_budget=data["max_budget"],
+        stopovers=data["stopovers"],
+        exclusions=exclusions,
+        baggage_needed=data["baggage_needed"]
     )
     
     await message.answer(
@@ -353,11 +421,22 @@ async def process_exclusions(message: types.Message, state: FSMContext):
     )
     
     # Trigger immediate calculation
-    asyncio.create_task(run_single_search_and_send(message.from_user.id, message.chat.id, data))
+    immediate_config = {
+        "origin_iata": data["origin_iata"],
+        "dest_iata": data["dest_iata"],
+        "date_start": data["date_start"],
+        "date_end": data["date_end"],
+        "max_budget": data["max_budget"],
+        "max_transfers": data["max_transfers"],
+        "baggage_needed": data["baggage_needed"],
+        "stopovers": data["stopovers"],
+        "exclusions": exclusions
+    }
+    asyncio.create_task(run_single_search_and_send(message.from_user.id, message.chat.id, immediate_config))
 
 @router.message(Command("my_searches", "mysearches"))
 async def cmd_my_searches(message: types.Message):
-    searches = get_user_searches(message.from_user.id)
+    searches = await asyncio.to_thread(get_user_searches, message.from_user.id)
     if not searches:
         await message.answer("📋 У вас пока нет настроенных активных поисков. Используйте /new_search для добавления!")
         return
@@ -378,13 +457,13 @@ async def cmd_my_searches(message: types.Message):
 async def cmd_delete_search(message: types.Message):
     try:
         search_id = int(message.text.split("_")[1])
-        delete_user_search(search_id, message.from_user.id)
+        await asyncio.to_thread(delete_user_search, search_id, message.from_user.id)
         await message.answer(f"✅ Мониторинг ID {search_id} успешно удален!")
     except Exception as e:
         await message.answer("❌ Неверный ID поиска. Попробуйте еще раз.")
 
 # Logic execution & background task
-async def run_single_search_and_send(user_id: int, chat_id: int, search_config: dict):
+async def run_single_search_and_send(user_id: int, chat_id: int, search_config: dict, is_monitor_job: bool = False):
     """Executes a single flight search cascade, path solver, LLM analyst, and sends result."""
     origin = search_config["origin_iata"]
     destination_country = search_config["dest_iata"]
@@ -392,23 +471,24 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
     date_end = search_config["date_end"]
     max_budget = search_config["max_budget"]
     max_transfers = search_config.get("max_transfers", 2)
+    baggage_needed = search_config.get("baggage_needed", 0)
+    stopovers_pref = search_config.get("stopovers", [])
+    exclusions = search_config.get("exclusions", [])
     
-    # Send initial status message to user
+    # Send initial status message to user (only if not a background monitoring job)
     status_msg = None
-    try:
-        status_msg = await bot.send_message(
-            chat_id,
-            "🔍 *Идет поиск авиабилетов...*\n\n"
-            "1️⃣ [Шаг 1/3] Построение динамического графа пересадок (bidirectional discovery)..."
-        )
-    except Exception as e:
-        logger.error(f"Failed to send status message: {e}")
+    if not is_monitor_job:
+        try:
+            status_msg = await bot.send_message(
+                chat_id,
+                "🔍 *Идет поиск авиабилетов...*\n\n"
+                "1️⃣ [Шаг 1/3] Построение динамического графа пересадок (bidirectional discovery)..."
+            )
+        except Exception as e:
+            logger.error(f"Failed to send status message: {e}")
         
-    # Hardcode Chinese destination airports if target is CN (China)
-    if destination_country == "CN":
-        china_destinations = ["PEK", "PVG", "CAN", "CTU", "URC", "XIY", "HGH", "HRB"]
-    else:
-        china_destinations = [destination_country] # If specific airport was target
+    # Resolve country destination airport codes deterministically or via LLM (Codex B)
+    destination_iatas = await resolve_destination_airports(destination_country)
         
     # Level 1: Fetch flight segment caches
     # We query the whole month range if dates span multiple months, or just the specific month YYYY-MM
@@ -428,7 +508,7 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         candidate_edges = await discovery_service.discover_candidate_edges(
             origin=origin,
             destination_country=destination_country,
-            destination_iatas=china_destinations,
+            destination_iatas=destination_iatas,
             months=months_list,
             max_transfers=max_transfers
         )
@@ -439,13 +519,13 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
     # If no candidate edges were discovered, fallback to static hubs so we don't return zero flights
     if not candidate_edges:
         logger.warning("No dynamic candidates found. Falling back to default transit hubs...")
-        hubs = get_all_transit_hubs()
+        hubs = await asyncio.to_thread(get_all_transit_hubs)
         candidate_edges = set()
         for hub in hubs:
             candidate_edges.add((origin, hub["iata"]))
-            for dest in china_destinations:
+            for dest in destination_iatas:
                 candidate_edges.add((hub["iata"], dest))
-        for dest in china_destinations:
+        for dest in destination_iatas:
             candidate_edges.add((origin, dest))
             
     # Compile actual query tasks
@@ -472,9 +552,14 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
             
     chunk_size = 5
     total_chunks = (len(tasks) + chunk_size - 1) // chunk_size
+    priced_flights = []
+    
     for i in range(0, len(tasks), chunk_size):
         chunk = tasks[i:i+chunk_size]
-        await asyncio.gather(*chunk)
+        results = await asyncio.gather(*chunk)
+        for res in results:
+            if res:
+                priced_flights.extend(res)
         
         # Update progress to user
         if status_msg:
@@ -503,26 +588,30 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         except Exception:
             pass
             
-    # Level 2: Solve DAG & Scorer
+    # Level 2: Solve DAG & Scorer (Codex E: pass priced_flights in memory)
     solved_data = solver.solve(
         origin_iata=origin,
         destination_country_code=destination_country,
-        destination_iatas=china_destinations,
+        destination_iatas=destination_iatas,
         date_start_str=date_start,
         date_end_str=date_end,
+        priced_flights=priced_flights,
         max_transfers=max_transfers,
         visa_allowed=1,
         lodging_exceptions=search_config.get("lodging_exceptions", {}),
-        max_budget=max_budget
+        max_budget=max_budget,
+        baggage_needed=baggage_needed,
+        stopovers_pref=stopovers_pref,
+        exclusions=exclusions
     )
     
     # Extract explored transit hubs from candidate edges
     explored_hubs = set()
     for edge in candidate_edges:
         u, v = edge
-        if u != origin and u not in china_destinations:
+        if u != origin and u not in destination_iatas:
             explored_hubs.add(u)
-        if v != origin and v not in china_destinations:
+        if v != origin and v not in destination_iatas:
             explored_hubs.add(v)
             
     # Build search metadata for transparency report
@@ -532,7 +621,7 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         "total_routes_found": solved_data.get("total_routes_found_before_filter", 0),
         "is_fallback_active": solved_data.get("is_fallback_active", False),
         "max_transfers": max_transfers,
-        "china_destinations": china_destinations
+        "china_destinations": destination_iatas
     }
     
     # LLM Cognitive Analysis
@@ -555,17 +644,28 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
             
     # Send report
     try:
-        # Check cheapest path price to update last_checked_price
         cheapest_routes = solved_data.get("cheapest", [])
         best_price = cheapest_routes[0]["total_price"] if cheapest_routes else 0
         
-        # Split message if it is too long for Telegram (4096 chars limit)
-        if len(analysis_text) > 4000:
-            for x in range(0, len(analysis_text), 4000):
-                await bot.send_message(chat_id, analysis_text[x:x+4000], parse_mode="Markdown", disable_web_page_preview=True)
-        else:
-            await bot.send_message(chat_id, analysis_text, parse_mode="Markdown", disable_web_page_preview=True)
-            
+        # Check price alerts for daily monitoring jobs (DOP-2)
+        if is_monitor_job:
+            last_price = search_config.get("last_checked_price", 0)
+            # If price didn't drop and we had a valid checked price, don't spam
+            if last_price > 0 and (best_price == 0 or best_price >= last_price):
+                logger.info(f"Price did not drop for search ID {search_config.get('search_id')}. Skipping notification.")
+                return best_price
+                
+            # If price dropped, prepend alert header
+            if last_price > 0 and best_price < last_price:
+                analysis_text = (
+                    f"🔔 **Мониторинг цен: Найдено снижение цены!**\n"
+                    f"📉 Предыдущая цена: {last_price:,.0f} ₽\n"
+                    f"🔥 Новая цена: {best_price:,.0f} ₽\n\n"
+                    + analysis_text
+                )
+        
+        # Send safe and split message (DOP-4)
+        await send_message_safely(chat_id, analysis_text)
         return best_price
     except Exception as e:
         logger.error(f"Failed to send telegram message: {e}")
@@ -574,37 +674,40 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
 # Scheduler job
 async def run_daily_monitoring_job():
     logger.info("Starting scheduled flight monitoring job...")
-    searches = get_all_active_searches()
+    searches = await asyncio.to_thread(get_all_active_searches)
     for s in searches:
         logger.info(f"Processing monitoring search ID {s['id']} for user {s['user_id']}")
         config_data = {
+            "search_id": s["id"],
+            "last_checked_price": s["last_checked_price"],
             "origin_iata": s["origin_iata"],
             "dest_iata": s["destination_text"],
             "date_start": s["date_start"],
             "date_end": s["date_end"],
             "max_budget": s["max_budget"],
             "max_transfers": s.get("max_transfers", 2),
-            "lodging_exceptions": json.loads(s.get("lodging_exceptions_json", "{}"))
+            "lodging_exceptions": json.loads(s.get("lodging_exceptions_json", "{}")),
+            "stopovers": json.loads(s.get("stopovers_json", "[]")),
+            "exclusions": json.loads(s.get("exclusions_json", "[]")),
+            "baggage_needed": s.get("baggage_needed", 0)
         }
         
-        # Run search
-        best_price = await run_single_search_and_send(s["user_id"], s["chat_id"], config_data)
+        # Run search with monitor flag active (DOP-2)
+        best_price = await run_single_search_and_send(s["user_id"], s["chat_id"], config_data, is_monitor_job=True)
         
-        # Update last checked price
+        # Update last checked price (async-safe thread)
         if best_price > 0:
-            update_last_checked_price(s["id"], best_price)
+            await asyncio.to_thread(update_last_checked_price, s["id"], best_price)
             
         await asyncio.sleep(5.0) # Gap between users to reduce rate load
 
 # Scheduler triggers configuration
 def setup_scheduler():
-    # Run every day at 10:00 local time
     scheduler.add_job(run_daily_monitoring_job, 'cron', hour=10, minute=0)
     scheduler.start()
     logger.info("Scheduler setup complete. Daily job scheduled at 10:00.")
 
 async def main():
-    # Configure scheduler and db
     setup_scheduler()
     logger.info("Starting Telegram Bot long-polling...")
     await dp.start_polling(bot)

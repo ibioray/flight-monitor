@@ -47,9 +47,20 @@ class RouteDiscoveryService:
             if dest in all_hubs:
                 all_hubs.remove(dest)
                 
-        # Limit to top 35 hubs to avoid query spikes, but keeping all major candidates
-        hubs_list = list(all_hubs)[:35]
-        logger.info(f"Total hubs to explore for topology: {len(hubs_list)}")
+        # Rank hubs deterministically by connection density (Codex H)
+        hub_popularity = {}
+        for hub in all_hubs:
+            score = 0
+            if hub in forward_hubs:
+                score += 10
+            if hub in backward_hubs:
+                score += 10
+            hub_popularity[hub] = score
+            
+        # Sort by popularity score (descending), then alphabetically by hub code (ascending)
+        sorted_hubs = sorted(all_hubs, key=lambda h: (-hub_popularity[h], h))
+        hubs_list = sorted_hubs[:35]
+        logger.info(f"Total hubs to explore for topology (sorted deterministically): {len(hubs_list)}")
         
         candidate_edges = set()
         

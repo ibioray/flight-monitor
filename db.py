@@ -1,7 +1,7 @@
 import sqlite3
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from config import DATABASE_PATH
 
 logger = logging.getLogger("db")
@@ -45,6 +45,16 @@ def init_db():
     )
     """)
     
+    # 2.1 Migrate user_searches non-destructively to add stopovers_json, exclusions_json, baggage_needed (DOP-1)
+    try:
+        cursor.execute("SELECT stopovers_json FROM user_searches LIMIT 1")
+    except sqlite3.OperationalError:
+        logger.info("Migrating user_searches table to add stopovers_json, exclusions_json, and baggage_needed...")
+        cursor.execute("ALTER TABLE user_searches ADD COLUMN stopovers_json TEXT DEFAULT '[]'")
+        cursor.execute("ALTER TABLE user_searches ADD COLUMN exclusions_json TEXT DEFAULT '[]'")
+        cursor.execute("ALTER TABLE user_searches ADD COLUMN baggage_needed INTEGER DEFAULT 0")
+        conn.commit()
+    
     # 3. Flight Cache Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS flight_cache (
@@ -56,6 +66,57 @@ def init_db():
         transfers_count INTEGER DEFAULT 0,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (origin, destination, depart_date)
+    )
+    """)
+    
+    # 3.1 Migrate flight_cache non-destructively to support departure_at, duration, direct_only, flight_number (Codex A)
+    try:
+        cursor.execute("SELECT departure_at FROM flight_cache LIMIT 1")
+    except sqlite3.OperationalError:
+        logger.info("Migrating flight_cache to support departure_at, duration, direct_only, and flight_number...")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS flight_cache_new (
+            origin TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            depart_date TEXT NOT NULL,
+            departure_at TEXT NOT NULL,
+            price REAL NOT NULL,
+            airline TEXT,
+            flight_number TEXT,
+            transfers_count INTEGER DEFAULT 0,
+            duration INTEGER DEFAULT 0, -- in minutes
+            direct_only INTEGER DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (origin, destination, departure_at)
+        )
+        """)
+        
+        # Copy old data safely
+        cursor.execute("""
+        INSERT INTO flight_cache_new (
+            origin, destination, depart_date, departure_at, price, 
+            airline, transfers_count, updated_at
+        )
+        SELECT 
+            origin, destination, depart_date, depart_date || 'T00:00:00Z', price,
+            airline, transfers_count, updated_at
+        FROM flight_cache
+        """)
+        
+        cursor.execute("DROP TABLE IF EXISTS flight_cache")
+        cursor.execute("ALTER TABLE flight_cache_new RENAME TO flight_cache")
+        conn.commit()
+        logger.info("flight_cache migration completed successfully.")
+        
+    # 3.2 Route Query Log Table (Codex D)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS route_query_log (
+        origin TEXT NOT NULL,
+        destination TEXT NOT NULL,
+        month TEXT NOT NULL,
+        direct_only INTEGER DEFAULT 0,
+        queried_at TEXT NOT NULL,
+        PRIMARY KEY (origin, destination, month, direct_only)
     )
     """)
     
@@ -140,13 +201,22 @@ def register_user(user_id: int, chat_id: int):
     conn.close()
 
 def save_user_search(user_id: int, origin_iata: str, destination_text: str, date_start: str, date_end: str, 
-                     max_transfers: int, visa_allowed: int, lodging_exceptions: dict, max_budget: int):
+                     max_transfers: int, visa_allowed: int, lodging_exceptions: dict, max_budget: int,
+                     stopovers: list = None, exclusions: list = None, baggage_needed: int = 0):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-    INSERT INTO user_searches (user_id, origin_iata, destination_text, date_start, date_end, max_transfers, visa_allowed, lodging_exceptions_json, max_budget)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, origin_iata, destination_text, date_start, date_end, max_transfers, visa_allowed, json.dumps(lodging_exceptions), max_budget))
+    INSERT INTO user_searches (
+        user_id, origin_iata, destination_text, date_start, date_end, 
+        max_transfers, visa_allowed, lodging_exceptions_json, max_budget,
+        stopovers_json, exclusions_json, baggage_needed
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id, origin_iata, destination_text, date_start, date_end, 
+        max_transfers, visa_allowed, json.dumps(lodging_exceptions), max_budget,
+        json.dumps(stopovers or []), json.dumps(exclusions or []), baggage_needed
+    ))
     conn.commit()
     conn.close()
 
@@ -188,7 +258,6 @@ def update_last_checked_price(search_id: int, price: float):
 def get_cached_flight(origin: str, destination: str, depart_date: str):
     conn = get_db_connection()
     cursor = conn.cursor()
-    # Expire cache after 24 hours
     cursor.execute("""
     SELECT * FROM flight_cache 
     WHERE origin = ? AND destination = ? AND depart_date = ?
@@ -198,19 +267,70 @@ def get_cached_flight(origin: str, destination: str, depart_date: str):
     conn.close()
     return dict(row) if row else None
 
-def save_flight_cache(origin: str, destination: str, depart_date: str, price: float, airline: str, transfers_count: int):
+# Route Query Log Helpers (Codex D)
+def check_route_query_log(origin: str, destination: str, month: str, direct_only: int) -> bool:
     conn = get_db_connection()
     cursor = conn.cursor()
-    updated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute("""
-    INSERT INTO flight_cache (origin, destination, depart_date, price, airline, transfers_count, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(origin, destination, depart_date) DO UPDATE SET
+    SELECT 1 FROM route_query_log
+    WHERE origin = ? AND destination = ? AND month = ? AND direct_only = ?
+    AND datetime(queried_at) >= datetime('now', '-24 hours')
+    """, (origin, destination, month, direct_only))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+def log_route_query(origin: str, destination: str, month: str, direct_only: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Use timezone-aware UTC datetime (Audit mitigation)
+    queried_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    INSERT INTO route_query_log (origin, destination, month, direct_only, queried_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(origin, destination, month, direct_only) DO UPDATE SET
+        queried_at = excluded.queried_at
+    """, (origin, destination, month, direct_only, queried_at))
+    conn.commit()
+    conn.close()
+
+def get_cached_flights(origin: str, destination: str, month: str, direct_only: int) -> list[dict]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if direct_only:
+        cursor.execute("""
+        SELECT * FROM flight_cache
+        WHERE origin = ? AND destination = ? AND depart_date LIKE ? AND transfers_count = 0
+        """, (origin, destination, f"{month}%"))
+    else:
+        cursor.execute("""
+        SELECT * FROM flight_cache
+        WHERE origin = ? AND destination = ? AND depart_date LIKE ?
+        """, (origin, destination, f"{month}%"))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def save_flight_cache(origin: str, destination: str, depart_date: str, departure_at: str, price: float, 
+                      airline: str, flight_number: str, transfers_count: int, duration: int, direct_only: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    INSERT INTO flight_cache (
+        origin, destination, depart_date, departure_at, price, 
+        airline, flight_number, transfers_count, duration, direct_only, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(origin, destination, departure_at) DO UPDATE SET
         price = excluded.price,
         airline = excluded.airline,
+        flight_number = excluded.flight_number,
         transfers_count = excluded.transfers_count,
+        duration = excluded.duration,
+        direct_only = excluded.direct_only,
         updated_at = excluded.updated_at
-    """, (origin, destination, depart_date, price, airline, transfers_count, updated_at))
+    """, (origin, destination, depart_date, departure_at, price, airline, flight_number, transfers_count, duration, direct_only, updated_at))
     conn.commit()
     conn.close()
 
@@ -232,5 +352,4 @@ def get_all_manual_legs():
     return [dict(r) for r in rows]
 
 if __name__ == "__main__":
-    # Test initialization
     init_db()
