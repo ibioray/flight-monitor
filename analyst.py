@@ -86,8 +86,9 @@ class LLMCognitiveAnalyst:
             is_fallback = search_metadata.get("is_fallback_active", False)
             hubs_list = ", ".join(search_metadata.get("hubs", [])) or "нет транзитных хабов (только прямые рейсы)"
             segments_count = search_metadata.get("segments_count", 0)
+            priced_segments_count = search_metadata.get("priced_segments_count", 0)
             total_routes = search_metadata.get("total_routes_found", 0)
-            dests = ", ".join(search_metadata.get("china_destinations", []))
+            dests = ", ".join(search_metadata.get("destination_iatas", search_metadata.get("china_destinations", [])))
             
             if is_fallback:
                 fallback_warning = f"""
@@ -100,7 +101,7 @@ class LLMCognitiveAnalyst:
 4. Обязательно добавь в самый конец отчета раздел '🔍 Прозрачность поиска' (без изменений в оформлении Markdown):
    - Укажи, какие транзитные хабы мы проверили: {hubs_list}
    - Напиши, что мы выполнили двунаправленный (bidirectional) поиск: проверили вылеты из {origin} и обратные прилеты во все аэропорты назначения в {destination} ({dests}), построив единый граф стыковок.
-   - Укажи, что всего было проанализировано {segments_count} сегментов перелетов и построено {total_routes} комбинаций маршрутов.
+   - Укажи, что всего было запланировано к проверке {segments_count} кандидатных сегментов, из них API/кэш вернул {priced_segments_count} priced-сегментов, и на них было построено {total_routes} комбинаций маршрутов.
 """
 
         prompt = f"""
@@ -221,14 +222,16 @@ class LLMCognitiveAnalyst:
         if search_metadata:
             hubs_list = ", ".join(search_metadata.get("hubs", [])) or "нет транзитных хабов (только прямые рейсы)"
             segments_count = search_metadata.get("segments_count", 0)
+            priced_segments_count = search_metadata.get("priced_segments_count", 0)
             total_routes = search_metadata.get("total_routes_found", 0)
-            dests = ", ".join(search_metadata.get("china_destinations", []))
+            dests = ", ".join(search_metadata.get("destination_iatas", search_metadata.get("china_destinations", [])))
             
             lines.append("---")
             lines.append("🔍 **Прозрачность поиска:**")
             lines.append(f"- Проверенные транзитные хабы: {hubs_list}")
             lines.append(f"- Выполнен двунаправленный поиск ({origin} ➔ {dests})")
-            lines.append(f"- Проанализировано сегментов: {segments_count}")
+            lines.append(f"- Кандидатных сегментов к проверке: {segments_count}")
+            lines.append(f"- Priced-сегментов от API/кэша: {priced_segments_count}")
             lines.append(f"- Построено маршрутов: {total_routes}")
             
         return "\n".join(lines)

@@ -128,10 +128,11 @@ async def run_test():
     mock_metadata = {
         "hubs": ["MOW", "ALA", "EVN"],
         "segments_count": 12,
+        "priced_segments_count": len(priced_flights),
         "total_routes_found": 8,
         "is_fallback_active": results.get("is_fallback_active", False),
         "max_transfers": 3,
-        "china_destinations": china_airports
+        "destination_iatas": china_airports
     }
     
     analysis_report = await analyst.analyze_routes(

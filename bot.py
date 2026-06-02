@@ -55,7 +55,30 @@ COUNTRY_AIRPORTS = {
     "TH": ["BKK", "DMK", "HKT", "CNX", "USM", "KBV"],
     "VN": ["HAN", "SGN", "DAD", "CXR", "PQC"],
     "TR": ["IST", "SAW", "AYT", "ESB", "ADB"],
-    "AE": ["DXB", "AUH", "SHJ", "DWC"]
+    "AE": ["DXB", "AUH", "SHJ", "DWC"],
+    "AM": ["EVN"],
+    "KZ": ["ALA", "NQZ", "CIT", "SCO"],
+    "UZ": ["TAS", "SKD", "BHK", "UGC"],
+    "KG": ["FRU", "OSS"],
+    "AZ": ["GYD"],
+    "GE": ["TBS", "BUS", "KUT"],
+    "JP": ["TYO", "HND", "NRT", "KIX", "ITM", "NGO", "FUK", "CTS", "OKA"],
+    "KR": ["SEL", "ICN", "GMP", "PUS", "CJU"],
+    "ID": ["CGK", "DPS", "SUB", "KNO", "UPG"],
+    "MY": ["KUL", "PEN", "BKI", "KCH", "LGK"],
+    "SG": ["SIN"],
+    "IN": ["DEL", "BOM", "BLR", "MAA", "HYD", "CCU", "GOI", "COK"],
+    "LK": ["CMB"],
+    "MV": ["MLE"],
+    "PH": ["MNL", "CEB", "CRK", "DVO"],
+    "AU": ["SYD", "MEL", "BNE", "PER", "ADL"],
+    "US": ["NYC", "JFK", "EWR", "LAX", "SFO", "MIA", "ORD", "DFW", "SEA", "BOS"],
+    "DE": ["FRA", "MUC", "BER", "DUS", "HAM"],
+    "FR": ["PAR", "CDG", "ORY", "NCE", "LYS", "MRS"],
+    "IT": ["ROM", "FCO", "MXP", "LIN", "VCE", "NAP"],
+    "ES": ["MAD", "BCN", "AGP", "ALC", "PMI"],
+    "GB": ["LON", "LHR", "LGW", "STN", "MAN", "EDI"],
+    "EG": ["CAI", "HRG", "SSH", "LXR", "HBE"]
 }
 
 # Helpers for dynamic LLM Parsing
@@ -131,10 +154,16 @@ async def get_airports_for_country_with_llm(country_code: str) -> list[str]:
     if resp_text:
         try:
             cleaned = resp_text.strip().replace("```json", "").replace("```", "")
-            return json.loads(cleaned)
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, list):
+                return [
+                    str(code).upper().strip()
+                    for code in parsed
+                    if isinstance(code, str) and len(code.strip()) == 3 and code.strip().isalpha()
+                ][:8]
         except Exception as e:
             logger.error(f"Failed to parse LLM airports response JSON: {e}. Raw response: {resp_text}")
-    return [country_code] # fallback
+    return []
 
 async def resolve_destination_airports(country_code: str) -> list[str]:
     """Returns top airport IATA codes for a country using deterministic catalog first (Codex B)."""
@@ -142,6 +171,11 @@ async def resolve_destination_airports(country_code: str) -> list[str]:
     if code in COUNTRY_AIRPORTS:
         logger.info(f"Resolved airports for {code} deterministically: {COUNTRY_AIRPORTS[code]}")
         return COUNTRY_AIRPORTS[code]
+
+    # Allow explicit IATA airport/city codes if the user entered one instead of a country code.
+    if len(code) == 3 and code.isalpha():
+        logger.info(f"Treating {code} as an explicit airport/city IATA code.")
+        return [code]
     
     # LLM fallback
     logger.info(f"Resolving airports for {code} dynamically via LLM...")
@@ -489,6 +523,20 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         
     # Resolve country destination airport codes deterministically or via LLM (Codex B)
     destination_iatas = await resolve_destination_airports(destination_country)
+    if not destination_iatas:
+        logger.error(f"Could not resolve destination airports for {destination_country}")
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        if not is_monitor_job:
+            await send_message_safely(
+                chat_id,
+                "❌ Не удалось определить аэропорты страны назначения. "
+                "Попробуйте указать конкретный IATA-код аэропорта/города или добавить страну в каталог."
+            )
+        return 0
         
     # Level 1: Fetch flight segment caches
     # We query the whole month range if dates span multiple months, or just the specific month YYYY-MM
@@ -618,9 +666,11 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
     metadata = {
         "hubs": list(explored_hubs),
         "segments_count": len(candidate_edges),
+        "priced_segments_count": len(priced_flights),
         "total_routes_found": solved_data.get("total_routes_found_before_filter", 0),
         "is_fallback_active": solved_data.get("is_fallback_active", False),
         "max_transfers": max_transfers,
+        "destination_iatas": destination_iatas,
         "china_destinations": destination_iatas
     }
     
