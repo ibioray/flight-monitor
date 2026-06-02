@@ -205,10 +205,6 @@ class GraphSolver:
                             
             total_price = base_price + lodging_price
             
-            # Skip if budget is exceeded
-            if max_budget and total_price > max_budget:
-                continue
-                
             scored_routes.append({
                 "segments": route,
                 "base_price": base_price,
@@ -220,19 +216,37 @@ class GraphSolver:
                 "risk_warnings": risk_warnings
             })
             
-        # Categorize routes
+        # Split into within-budget and over-budget routes
+        within_budget_routes = []
+        over_budget_routes = []
+        for r in scored_routes:
+            if max_budget and r["total_price"] > max_budget:
+                over_budget_routes.append(r)
+            else:
+                within_budget_routes.append(r)
+                
+        # Determine if we need to fall back to over-budget options
+        is_fallback_active = False
+        target_routes = within_budget_routes
+        if not within_budget_routes and over_budget_routes:
+            target_routes = over_budget_routes
+            is_fallback_active = True
+            
+        # Categorize routes from the selected target list
         # 1. Cheapest
-        cheapest_routes = sorted(scored_routes, key=lambda x: x["total_price"])[:5]
+        cheapest_routes = sorted(target_routes, key=lambda x: x["total_price"])[:5]
         
         # 2. Fastest
-        fastest_routes = sorted(scored_routes, key=lambda x: (x["duration_days"], x["total_price"]))[:5]
+        fastest_routes = sorted(target_routes, key=lambda x: (x["duration_days"], x["total_price"]))[:5]
         
         # 3. Smart Stopovers (Must have at least one stopover of >= 2 days)
-        stopover_routes = [r for r in scored_routes if len(r["stopovers"]) > 0]
+        stopover_routes = [r for r in target_routes if len(r["stopovers"]) > 0]
         stopover_routes = sorted(stopover_routes, key=lambda x: x["total_price"])[:5]
         
         return {
             "cheapest": cheapest_routes,
             "fastest": fastest_routes,
-            "stopovers": stopover_routes
+            "stopovers": stopover_routes,
+            "is_fallback_active": is_fallback_active,
+            "total_routes_found_before_filter": len(scored_routes)
         }

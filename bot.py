@@ -516,6 +516,25 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         max_budget=max_budget
     )
     
+    # Extract explored transit hubs from candidate edges
+    explored_hubs = set()
+    for edge in candidate_edges:
+        u, v = edge
+        if u != origin and u not in china_destinations:
+            explored_hubs.add(u)
+        if v != origin and v not in china_destinations:
+            explored_hubs.add(v)
+            
+    # Build search metadata for transparency report
+    metadata = {
+        "hubs": list(explored_hubs),
+        "segments_count": len(candidate_edges),
+        "total_routes_found": solved_data.get("total_routes_found_before_filter", 0),
+        "is_fallback_active": solved_data.get("is_fallback_active", False),
+        "max_transfers": max_transfers,
+        "china_destinations": china_destinations
+    }
+    
     # LLM Cognitive Analysis
     date_range = f"{date_start} — {date_end}"
     analysis_text = await analyst.analyze_routes(
@@ -523,7 +542,8 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         destination=destination_country,
         date_range=date_range,
         max_budget=max_budget,
-        solved_data=solved_data
+        solved_data=solved_data,
+        search_metadata=metadata
     )
     
     # Delete status message before sending final report

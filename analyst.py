@@ -66,7 +66,7 @@ class LLMCognitiveAnalyst:
         return json.dumps(formatted_list, ensure_ascii=False, indent=2)
 
     async def analyze_routes(self, origin: str, destination: str, date_range: str, 
-                             max_budget: float, solved_data: dict) -> str:
+                             max_budget: float, solved_data: dict, search_metadata: dict = None) -> str:
         """
         Takes the categorized paths from GraphSolver, runs them through Gemini,
         and returns a beautiful, formatted Russian summary message.
@@ -79,8 +79,34 @@ class LLMCognitiveAnalyst:
         if not solved_data.get("cheapest") and not solved_data.get("fastest") and not solved_data.get("stopovers"):
             return "❌ К сожалению, по вашему запросу не найдено ни одного подходящего билета. Попробуйте изменить диапазон дат или увеличить бюджет!"
 
+        fallback_warning = ""
+        transparency_instruction = ""
+        
+        if search_metadata:
+            is_fallback = search_metadata.get("is_fallback_active", False)
+            hubs_list = ", ".join(search_metadata.get("hubs", [])) or "нет транзитных хабов (только прямые рейсы)"
+            segments_count = search_metadata.get("segments_count", 0)
+            total_routes = search_metadata.get("total_routes_found", 0)
+            dests = ", ".join(search_metadata.get("china_destinations", []))
+            
+            if is_fallback:
+                fallback_warning = f"""
+⚠️ ВНИМАНИЕ: Ни один из найденных вариантов не укладывается в бюджет {max_budget:,} ₽!
+В связи с этим, ИИ-анализатор показывает лучшие из найденных вариантов, которые ПРЕВЫШАЮТ бюджет.
+Обязательно начни свой отчет с предупреждения о том, что билетов до {max_budget:,} ₽ не найдено, и покажи варианты с наименьшим превышением бюджета.
+"""
+            
+            transparency_instruction = f"""
+4. Обязательно добавь в самый конец отчета раздел '🔍 Прозрачность поиска' (без изменений в оформлении Markdown):
+   - Укажи, какие транзитные хабы мы проверили: {hubs_list}
+   - Напиши, что мы выполнили двунаправленный (bidirectional) поиск: проверили вылеты из {origin} и обратные прилеты во все аэропорты назначения в {destination} ({dests}), построив единый граф стыковок.
+   - Укажи, что всего было проанализировано {segments_count} сегментов перелетов и построено {total_routes} комбинаций маршрутов.
+"""
+
         prompt = f"""
 Ты — умный тревел-аналитик и эксперт по сложным каскадным маршрутам. Твоя задача — помочь путешественнику выбрать лучший способ добраться из города {origin} в {destination} в даты {date_range} с бюджетом до {max_budget} рублей.
+
+{fallback_warning}
 
 Перед тобой результаты работы математического графового построителя маршрутов. Он нашел реальные варианты билетов через API и скомпоновал их. Цены и даты абсолютно точны, не выдумывай свои!
 
@@ -96,18 +122,19 @@ class LLMCognitiveAnalyst:
 {stopovers_json}
 
 Твоя задача — написать красивый, структурированный отчет на русском языке для отправки в Telegram:
-1. Сделай краткое вступление.
+1. Сделай краткое вступление. { "Обязательно упомяни, что это варианты с превышением бюджета, так как в рамках бюджета билетов не нашлось." if fallback_warning else "" }
 2. Представь топ-3 лучших/интересных вариантов (выбери самые адекватные из списков выше). Для каждого варианта:
    - Понятно распиши цепочку: Откуда -> Куда (дата, цена, вид транспорта).
    - Укажи полную стоимость (билеты + условное жилье в хабах).
    - Выдели плюсы и минусы/риски (особенно если это самостоятельная стыковка с получением багажа, смена аэропорта в Москве или короткий транзит).
-   - Обязательно вставь кликабельные Markdown ссылки на покупку билетов (booking_link) для каждого авиа-сегмента! Ссылки должны выглядеть аккуратно, например: [Купить билет UFA -> MOW](ссылка).
+   - Обязательно вставь кликабельные Markdown ссылки на покупку билетов (booking_link) для каждого авиа-сегмента! Ссылки должны выглядеть аккуратно, например: [Купить билет {origin} -> MOW](ссылка).
 3. Дай финальную рекомендацию: какой вариант выбрать в зависимости от целей (сэкономить, долететь без нервов или устроить мини-путешествие).
+{transparency_instruction}
 
 Правила оформления:
 - Пиши живым, экспертным языком, без канцеляризмов.
 - Используй эмодзи для наглядности.
-- Соблюдай Markdown разметку для Telegram.
+- Соблюдай Markdown разметку для Telegram (используй * для жирного шрифта, не используй ** внутри других стилей, делай ссылки [текст](урл)).
 - Если у варианта высокий риск (например, airport change или короткая стыковка), выдели это жирным шрифтом и предупреди пользователя!
 """
 
@@ -137,7 +164,7 @@ class LLMCognitiveAnalyst:
                         logger.error(f"OpenRouter returned empty choices: {result}")
             except Exception as e:
                 logger.error(f"OpenRouter API error: {e}")
-            return "⚠️ Произошла ошибка OpenRouter при анализе ИИ. Вот сырые варианты:\n\n" + self._generate_mock_analysis(solved_data)
+            return "⚠️ Произошла ошибка OpenRouter при анализе ИИ. Вот сырые варианты:\n\n" + self._generate_mock_analysis(solved_data, origin, destination, search_metadata)
 
         elif self.model_type == "gemini" and self.model:
             try:
@@ -146,15 +173,22 @@ class LLMCognitiveAnalyst:
                 return response.text
             except Exception as e:
                 logger.error(f"Gemini API error: {e}")
-                return "⚠️ Произошла ошибка при анализе маршрутов нейросетью. Но вот сырые варианты:\n\n" + self._generate_mock_analysis(solved_data)
+                return "⚠️ Произошла ошибка при анализе маршрутов нейросетью. Но вот сырые варианты:\n\n" + self._generate_mock_analysis(solved_data, origin, destination, search_metadata)
 
         else:
             logger.info("Running analyst in mock mode.")
-            return self._generate_mock_analysis(solved_data)
+            return self._generate_mock_analysis(solved_data, origin, destination, search_metadata)
 
-    def _generate_mock_analysis(self, solved_data: dict) -> str:
+    def _generate_mock_analysis(self, solved_data: dict, origin: str = "", destination: str = "", search_metadata: dict = None) -> str:
         """Fallback markdown generator if LLM is offline or unconfigured."""
-        lines = ["✈️ **Найденные варианты маршрутов:**\n"]
+        lines = []
+        
+        is_fallback = solved_data.get("is_fallback_active", False)
+        if is_fallback:
+            lines.append("⚠️ **Внимание: Билетов в рамках вашего бюджета не найдено!**")
+            lines.append("Показываем лучшие найденные варианты с наименьшим превышением бюджета:\n")
+        else:
+            lines.append("✈️ **Найденные варианты маршрутов:**\n")
         
         categories = [
             ("🌟 Самый дешевый", "cheapest"),
@@ -184,4 +218,17 @@ class LLMCognitiveAnalyst:
                     lines.append(f"   ⚠️ *Риски:* {', '.join(r['risk_warnings'])}")
                 lines.append("")
                 
+        if search_metadata:
+            hubs_list = ", ".join(search_metadata.get("hubs", [])) or "нет транзитных хабов (только прямые рейсы)"
+            segments_count = search_metadata.get("segments_count", 0)
+            total_routes = search_metadata.get("total_routes_found", 0)
+            dests = ", ".join(search_metadata.get("china_destinations", []))
+            
+            lines.append("---")
+            lines.append("🔍 **Прозрачность поиска:**")
+            lines.append(f"- Проверенные транзитные хабы: {hubs_list}")
+            lines.append(f"- Выполнен двунаправленный поиск ({origin} ➔ {dests})")
+            lines.append(f"- Проанализировано сегментов: {segments_count}")
+            lines.append(f"- Построено маршрутов: {total_routes}")
+            
         return "\n".join(lines)

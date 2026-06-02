@@ -81,20 +81,67 @@ async def run_test():
     logger.info(f"Best cheapest route (Total Cost: {best_route['total_price']:.0f} ₽, Tickets: {best_route['base_price']:.0f} ₽, Lodging: {best_route['lodging_price']:.0f} ₽):")
     logger.info(f"  {chain}")
     
-    # 4. LLM Analyst test
-    logger.info("Testing LLMCognitiveAnalyst...")
+    # 4. LLM Analyst test with search metadata
+    logger.info("Testing LLMCognitiveAnalyst with search metadata...")
     analyst = LLMCognitiveAnalyst()
+    
+    mock_metadata = {
+        "hubs": ["MOW", "ALA", "EVN"],
+        "segments_count": 12,
+        "total_routes_found": 8,
+        "is_fallback_active": results.get("is_fallback_active", False),
+        "max_transfers": 3,
+        "china_destinations": china_airports
+    }
+    
     analysis_report = await analyst.analyze_routes(
         origin=origin,
         destination=destination_country,
         date_range=f"{date_start} — {date_end}",
         max_budget=max_budget,
-        solved_data=results
+        solved_data=results,
+        search_metadata=mock_metadata
     )
     
-    print("\n" + "=" * 40 + " ANALYSIS REPORT " + "=" * 40)
+    print("\n" + "=" * 40 + " STANDARD ANALYSIS REPORT " + "=" * 40)
     print(analysis_report)
     print("=" * 97 + "\n")
+    
+    # 5. Low Budget Fallback Test
+    logger.info("Testing solver fallback for low budget (5,000 RUB)...")
+    fallback_results = solver.solve(
+        origin_iata=origin,
+        destination_country_code=destination_country,
+        destination_iatas=china_airports,
+        date_start_str=date_start,
+        date_end_str=date_end,
+        max_transfers=3,
+        visa_allowed=1,
+        lodging_exceptions={"EVN": 0.0},
+        max_budget=5000.0
+    )
+    
+    assert fallback_results["is_fallback_active"] is True, "Error: Fallback should be active for low budget!"
+    logger.info(f"Fallback active: {fallback_results['is_fallback_active']}")
+    logger.info(f"Routes found in fallback: {len(fallback_results['cheapest'])}")
+    
+    # Analyze fallback results
+    fallback_metadata = dict(mock_metadata)
+    fallback_metadata["is_fallback_active"] = True
+    
+    fallback_report = await analyst.analyze_routes(
+        origin=origin,
+        destination=destination_country,
+        date_range=f"{date_start} — {date_end}",
+        max_budget=5000.0,
+        solved_data=fallback_results,
+        search_metadata=fallback_metadata
+    )
+    
+    print("\n" + "=" * 40 + " FALLBACK ANALYSIS REPORT " + "=" * 40)
+    print(fallback_report)
+    print("=" * 97 + "\n")
+    
     logger.info("Test finished successfully!")
 
 if __name__ == "__main__":
