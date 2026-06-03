@@ -9,7 +9,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -18,14 +18,17 @@ from db import (
     register_user, save_user_search, get_user_searches, delete_user_search,
     get_all_active_searches, update_last_checked_price, get_all_transit_hubs,
     get_all_manual_legs, save_search_snapshot, get_route_snapshot,
-    get_snapshot_routes, get_discovery_cache, save_discovery_cache,
+    get_latest_search_snapshot, get_snapshot_routes, get_discovery_cache, save_discovery_cache,
     clear_price_cache_for_edges, get_cache_status_for_search,
-    get_db_connection, update_price_drop_threshold
+    get_db_connection, update_price_drop_threshold,
+    subscribe_route, get_user_route_subscriptions, get_all_active_route_subscriptions,
+    update_route_subscription_baseline, deactivate_route_subscription
 )
 from providers import TravelpayoutsProvider
 from solver import GraphSolver
 from analyst import LLMCognitiveAnalyst
 from discovery import RouteDiscoveryService
+from airport_names import annotate_iata_codes, format_iata_city
 from monitoring import (
     DEFAULT_PRICE_DROP_THRESHOLD_PCT,
     PRICE_DROP_THRESHOLD_OPTIONS,
@@ -294,7 +297,7 @@ async def parse_dates_with_llm(text: str) -> dict:
         "desc": text
     }
 
-async def send_message_safely(chat_id: int, text: str):
+async def send_message_safely(chat_id: int, text: str, reply_markup=None):
     """Sends long messages safely, splitting by newlines and falling back to plain text if Markdown fails (DOP-4)."""
     chunks = []
     current_chunk = []
@@ -312,14 +315,15 @@ async def send_message_safely(chat_id: int, text: str):
     if current_chunk:
         chunks.append("\n".join(current_chunk))
 
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
+        markup = reply_markup if index == len(chunks) - 1 else None
         try:
-            await bot.send_message(chat_id, chunk, parse_mode="Markdown", disable_web_page_preview=True)
+            await bot.send_message(chat_id, chunk, parse_mode="Markdown", disable_web_page_preview=True, reply_markup=markup)
         except Exception as e:
             logger.error(f"Markdown send failed: {e}. Falling back to plain text.")
             try:
                 # Fallback without parse_mode
-                await bot.send_message(chat_id, chunk, disable_web_page_preview=True)
+                await bot.send_message(chat_id, chunk, disable_web_page_preview=True, reply_markup=markup)
             except Exception as e2:
                 logger.error(f"Plain text send failed as well: {e2}")
 
@@ -370,6 +374,183 @@ def _parse_more_routes_args(text: str) -> tuple[int | None, int, str]:
                 pass
 
     return search_id, offset, sort_mode
+
+def _callback_search_id(value: str | int | None) -> int | None:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return parsed or None
+
+def result_actions_keyboard(search_id: int | None, routes: list[dict] | None = None, offset: int = 5, sort_mode: str = "balanced"):
+    builder = InlineKeyboardBuilder()
+    sid = int(search_id or 0)
+    builder.button(text="Еще 5", callback_data=f"more:{sid}:{offset}:{sort_mode}")
+    builder.button(text="По цене", callback_data=f"sort:{sid}:price")
+    builder.button(text="По времени", callback_data=f"sort:{sid}:duration")
+    builder.button(text="Диагностика", callback_data=f"diag:{sid}")
+    for route in (routes or [])[:3]:
+        route_id = route.get("route_id")
+        if route_id:
+            builder.button(text=f"{route_id}", callback_data=f"route:{sid}:{route_id}")
+    builder.adjust(2, 2, 3)
+    return builder.as_markup()
+
+def route_actions_keyboard(search_id: int | None, route_id: str):
+    builder = InlineKeyboardBuilder()
+    sid = int(search_id or 0)
+    builder.button(text="Подписаться на маршрут", callback_data=f"subroute:{sid}:{route_id}")
+    builder.button(text="Обновить цены", callback_data=f"refresh_route:{sid}:{route_id}")
+    builder.button(text="Почему так", callback_data=f"why_route:{sid}:{route_id}")
+    builder.button(text="Еще 5", callback_data=f"more:{sid}:5:balanced")
+    builder.adjust(1, 1, 2)
+    return builder.as_markup()
+
+def subscription_actions_keyboard(subscription_id: int, route_id: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Обновить маршрут", callback_data=f"refresh_sub:{subscription_id}:{route_id}")
+    builder.button(text="Отписаться", callback_data=f"unsubroute:{subscription_id}")
+    builder.adjust(1, 1)
+    return builder.as_markup()
+
+def _route_line(route: dict) -> str:
+    duration_hours = float(route.get("duration_hours") or 0)
+    hours = int(duration_hours)
+    minutes = int(round((duration_hours - hours) * 60))
+    duration = f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+    price = f"{float(route.get('total_price') or 0):,.0f}".replace(",", " ")
+    return f"{route.get('route_id')} — {price} ₽, {duration}, сегментов: {route.get('segments_count', len(route.get('segments', [])))}"
+
+def _diagnostic_reason_ru(reason: str) -> str:
+    return {
+        "not_in_top_5_diverse_summary": "не попал в первые 5 разнообразных вариантов",
+    }.get(reason, reason or "причина не указана")
+
+def render_search_diagnostics(snapshot: dict) -> str:
+    metadata = json.loads(snapshot.get("metadata_json") or "{}")
+    solved_data = json.loads(snapshot.get("solved_data_json") or "{}")
+    omitted = solved_data.get("omitted_routes", [])[:10]
+    raw_routes = metadata.get("total_routes_found", solved_data.get("total_routes_found_before_filter", 0))
+    scored_routes = metadata.get("total_routes_scored", solved_data.get("total_routes_scored", 0))
+    filtered_routes = metadata.get("total_routes_after_filter", solved_data.get("total_routes_after_filter", 0))
+    rendered = metadata.get("rendered_routes_count", solved_data.get("rendered_routes_count", 0))
+    priced_edges = metadata.get("priced_edges_count")
+    if priced_edges is None:
+        priced_edges = "нет данных"
+    unpriced_edges = metadata.get("unpriced_candidate_edges_count")
+    if unpriced_edges is None:
+        unpriced_edges = "нет данных"
+
+    flags = []
+    if metadata.get("partial_data"):
+        flags.append("данные API неполные")
+    if metadata.get("route_cap_hit") or solved_data.get("route_cap_hit"):
+        flags.append("сработал лимит перебора маршрутов")
+    if metadata.get("is_fallback_active") or solved_data.get("is_fallback_active"):
+        flags.append("в бюджете не нашлось, показаны ближайшие")
+    if not flags:
+        flags.append("критичных флагов нет")
+
+    lines = [
+        "🧪 *Диагностика поиска*",
+        f"Поиск: `{snapshot.get('origin_iata')}` -> `{snapshot.get('destination_text')}`",
+        f"Даты: {snapshot.get('date_start')} — {snapshot.get('date_end')}",
+        "",
+        f"Discovery cache: {'да' if metadata.get('discovery_cache_hit') else 'нет'}",
+        f"Кандидатных сегментов: {metadata.get('segments_count', 0)}",
+        f"Сегментов с ценами: {metadata.get('priced_segments_count', 0)}",
+        f"Уникальных priced-ребер: {priced_edges}",
+        f"Кандидатных ребер без цены: {unpriced_edges}",
+        "",
+        f"Маршруты: raw DFS {raw_routes} -> scored {scored_routes} -> after filters {filtered_routes} -> shown {rendered}",
+        "Флаги: " + ", ".join(flags),
+    ]
+
+    discovery_diag = metadata.get("discovery_diagnostics") or {}
+    edge_categories = discovery_diag.get("edge_categories") or {}
+    if discovery_diag:
+        top_hubs = ", ".join(format_iata_city(hub) for hub in discovery_diag.get("selected_first_hubs", [])[:8])
+        if not top_hubs:
+            top_hubs = "нет"
+        lines.extend([
+            "",
+            f"Discovery algorithm: {discovery_diag.get('algorithm', 'unknown')}",
+            f"Forward hubs из точки старта: {discovery_diag.get('forward_hubs_count', 0)}",
+            f"Backward hubs в страну: {discovery_diag.get('backward_hubs_count', 0)}",
+            f"Хабов для 1 пересадки: {discovery_diag.get('one_transfer_hubs_count', 0)}",
+            f"Первые хабы для bridge-поиска: {discovery_diag.get('selected_first_hubs_count', 0)} ({top_hubs})",
+            "Категории ребер: "
+            f"direct {edge_categories.get('direct_validation', 0)}, "
+            f"origin->hub {edge_categories.get('one_transfer_origin', 0)}, "
+            f"hub->target {edge_categories.get('target_side', edge_categories.get('one_transfer_target', 0))}, "
+            f"bridge {edge_categories.get('bridge', 0)}, "
+            f"bridge->target {edge_categories.get('bridge_to_target', 0)}",
+        ])
+
+    if omitted:
+        lines.append("")
+        lines.append("*Не показаны в первых 5:*")
+        for item in omitted:
+            lines.append(f"- {_route_line(item)}: {_diagnostic_reason_ru(item.get('reason'))}")
+    else:
+        lines.append("")
+        lines.append("Не показанных сохраненных маршрутов нет.")
+
+    return "\n".join(lines)
+
+def render_route_diagnostics(route_row: dict, snapshot: dict | None = None) -> str:
+    route = json.loads(route_row["route_json"])
+    route_id = route.get("route_id")
+    badges = ", ".join(route.get("badges") or []) or "нет"
+    stopovers = route.get("stopovers") or []
+    risks = [annotate_iata_codes(risk) for risk in route.get("risk_warnings", [])]
+    omitted_reason = None
+    if snapshot:
+        solved_data = json.loads(snapshot.get("solved_data_json") or "{}")
+        for item in solved_data.get("omitted_routes", []):
+            if item.get("route_id") == route_id:
+                omitted_reason = _diagnostic_reason_ru(item.get("reason"))
+                break
+
+    lines = [
+        f"🧪 *Диагностика маршрута {route_id}*",
+        f"Статус: {'показан в топе' if route.get('badges') else 'сохранен в результатах'}",
+        f"Бейджи: {badges}",
+        f"Цена: {float(route.get('total_price') or 0):,.0f} ₽".replace(",", " "),
+        f"Билеты: {float(route.get('base_price') or 0):,.0f} ₽ | жилье: {float(route.get('lodging_price') or 0):,.0f} ₽".replace(",", " "),
+        f"Время: {route.get('duration_hours', 0):.1f} ч",
+        f"Risk score: {route.get('risk_score', 0)}",
+    ]
+    if omitted_reason:
+        lines.append(f"Почему не в первых 5: {omitted_reason}.")
+    if stopovers:
+        lines.append("Стоповеры:")
+        for stop in stopovers:
+            city = format_iata_city(stop.get("city", ""))
+            name = stop.get("name")
+            label = name if name and name != stop.get("city") else city
+            lines.append(f"- {label}: {stop.get('layover_hours', 0)} ч, {stop.get('layover_type')}")
+    if risks:
+        lines.append("Риски:")
+        for risk in risks[:5]:
+            lines.append(f"- {risk}")
+    if route.get("estimated_timing"):
+        lines.append("Тайминг частично расчетный: перед покупкой лучше обновить маршрут.")
+    return "\n".join(lines)
+
+def render_route_subscription(sub: dict) -> str:
+    route = json.loads(sub.get("route_json") or "{}")
+    price = float(sub.get("last_checked_price") or route.get("total_price") or 0)
+    threshold = format_price_drop_threshold(sub.get("price_drop_threshold_pct"))
+    checked = sub.get("last_checked_at") or "не проверялось"
+    route_line = _route_line(route) if route else sub.get("route_id", "")
+    return (
+        f"🔔 *Подписка #{sub['id']}*\n"
+        f"{route_line}\n"
+        f"Маршрут: `{format_iata_city(sub.get('origin_iata'))}` -> `{sub.get('destination_text')}`\n"
+        f"Порог: падение от {threshold}\n"
+        f"Baseline: {price:,.0f} ₽ ({checked})".replace(",", " ")
+    )
 
 async def _render_snapshot_routes(rows: list[dict], metadata: dict | None = None) -> str:
     routes = [json.loads(row["route_json"]) for row in rows]
@@ -468,7 +649,7 @@ async def cmd_new_search(message: types.Message, state: FSMContext):
     await asyncio.to_thread(register_user, message.from_user.id, message.chat.id)
     await state.clear()
     await state.set_state(SearchWizard.waiting_for_origin)
-    await message.answer("🏙️ **Шаг 1 из 10:** Откуда летим?\nНапишите название города (например, Уфа) или его IATA-код (UFA):")
+    await message.answer("🏙️ **Шаг 1 из 11:** Откуда летим?\nНапишите название города (например, Уфа) или его IATA-код (UFA):")
 
 @router.message(SearchWizard.waiting_for_origin)
 async def process_origin(message: types.Message, state: FSMContext):
@@ -481,7 +662,7 @@ async def process_origin(message: types.Message, state: FSMContext):
     await state.set_state(SearchWizard.waiting_for_destination)
     await message.answer(
         f"✅ Город отправления определен как: **{resolved.get('resolved_name', origin_text)} ({resolved['iata']})**\n\n"
-        f"🌏 **Шаг 2 из 10:** Куда летим?\nНапишите название страны назначения (например, Китай, Вьетнам, Таиланд) или код IATA:"
+        f"🌏 **Шаг 2 из 11:** Куда летим?\nНапишите название страны назначения (например, Китай, Вьетнам, Таиланд) или код IATA:"
     )
 
 @router.message(SearchWizard.waiting_for_destination)
@@ -495,7 +676,7 @@ async def process_destination(message: types.Message, state: FSMContext):
     await state.set_state(SearchWizard.waiting_for_dates)
     await message.answer(
         f"✅ Страна назначения определена как: **{resolved.get('resolved_name', dest_text)} ({resolved['iata']})**\n\n"
-        f"📅 **Шаг 3 из 10:** Когда летим?\nНапишите дату или диапазон человеческим языком (например, *середина июня*, *ближайшие 2 недели*, *с 15 по 30 июня 2026*):"
+        f"📅 **Шаг 3 из 11:** Когда летим?\nНапишите дату или диапазон человеческим языком (например, *середина июня*, *ближайшие 2 недели*, *с 15 по 30 июня 2026*):"
     )
 
 @router.message(SearchWizard.waiting_for_dates)
@@ -513,7 +694,7 @@ async def process_dates(message: types.Message, state: FSMContext):
     await state.set_state(SearchWizard.waiting_for_budget)
     await message.answer(
         f"✅ Диапазон дат определен как: **{resolved['date_start']} — {resolved['date_end']} ({resolved['desc']})**\n\n"
-        f"💰 **Шаг 4 из 10:** Максимальный бюджет?\nВведите максимальную стоимость билетов в рублях (например, 50000, 50к, 20 тысяч):"
+        f"💰 **Шаг 4 из 11:** Максимальный бюджет?\nВведите максимальную стоимость билетов в рублях (например, 50000, 50к, 20 тысяч):"
     )
 
 def parse_budget(text: str) -> int | None:
@@ -744,7 +925,7 @@ async def process_exclusions(message: types.Message, state: FSMContext):
     })
 
     await message.answer(
-        "🎉 **Мониторинг успешно настроен!**\n\n"
+        "🎉 **Поиск сохранен и запущен!**\n\n"
         f"🆔 ID поиска: `{search_id}`\n"
         f"📍 Маршрут: `{data['origin_name']} ({data['origin_iata']})` ➔ `{data['dest_name']} ({data['dest_iata']})`\n"
         f"📅 Период: {data['date_start']} — {data['date_end']}\n"
@@ -754,7 +935,8 @@ async def process_exclusions(message: types.Message, state: FSMContext):
         f"✈️ Макс. перелетов: {data['max_transfers'] + 1}\n\n"
         f"⏱️ Стоповеры: {stopover_summary}\n\n"
         f"🛂 Визы: {format_visa_mode(data.get('visa_mode', 'visa_free_only'))}\n\n"
-        "🤖 Я запускаю первый фоновый расчет билетов через API и нейросеть. Это займет около 30-60 секунд..."
+        "🤖 Я запускаю расчет билетов через API и нейросеть. Это займет около 30-60 секунд.\n"
+        "После выдачи выберите подходящие маршруты кнопкой *Подписаться на маршрут*."
     )
 
     # Trigger immediate calculation
@@ -782,10 +964,10 @@ async def process_exclusions(message: types.Message, state: FSMContext):
 async def cmd_my_searches(message: types.Message):
     searches = await asyncio.to_thread(get_user_searches, message.from_user.id)
     if not searches:
-        await message.answer("📋 У вас пока нет настроенных активных поисков. Используйте /new_search для добавления!")
+        await message.answer("📋 У вас пока нет сохраненных поисков. Используйте /new_search для добавления!")
         return
 
-    text = ["📋 **Ваши активные мониторинги:**\n"]
+    text = ["📋 **Ваши сохраненные поиски:**\n"]
     for s in searches:
         stopovers = json.loads(s.get("stopovers_json") or "[]")
         exclusions = json.loads(s.get("exclusions_json") or "[]")
@@ -812,6 +994,7 @@ async def cmd_my_searches(message: types.Message):
             f"🔔 Порог: /set_price_alert {s['id']} 10\n"
             f"🔄 Обновить: /refresh_search {s['id']}\n"
             f"📊 Кэш: /cache_status {s['id']}\n"
+            f"🔔 Подписки: /my_route_alerts\n"
             f"Удалить: /del_{s['id']}\n"
             "---"
         )
@@ -848,6 +1031,69 @@ async def cmd_set_price_alert(message: types.Message):
     await message.answer(
         f"✅ Порог алерта для поиска ID {search_id} обновлен: падение от {format_price_drop_threshold(threshold)}."
     )
+
+@router.message(Command("subscribe_route"))
+async def cmd_subscribe_route(message: types.Message):
+    route_id, search_id = _parse_route_command_args(message.text or "")
+    if not route_id:
+        await message.answer("Укажите route_id: `/subscribe_route R-ABC123`\nМожно уточнить поиск: `/subscribe_route R-ABC123 12`")
+        return
+
+    threshold = None
+    parts = (message.text or "").split()
+    if len(parts) >= 4:
+        parsed_threshold = parse_price_drop_threshold(parts[3])
+        if parsed_threshold is not None:
+            threshold = parsed_threshold
+
+    sub = await asyncio.to_thread(
+        subscribe_route,
+        message.from_user.id,
+        message.chat.id,
+        route_id,
+        search_id,
+        threshold
+    )
+    if not sub:
+        await message.answer("Не нашел такой маршрут в ваших сохраненных результатах. Сначала откройте `/route R-...` или запустите поиск.")
+        return
+
+    await send_message_safely(
+        message.chat.id,
+        "✅ *Подписка на маршрут включена*\n\n" + render_route_subscription(sub),
+        reply_markup=subscription_actions_keyboard(sub["id"], sub["route_id"])
+    )
+
+@router.message(Command("my_route_alerts", "my_alerts", "subscriptions"))
+async def cmd_my_route_alerts(message: types.Message):
+    subs = await asyncio.to_thread(get_user_route_subscriptions, message.from_user.id)
+    if not subs:
+        await message.answer(
+            "🔔 У вас пока нет подписок на конкретные маршруты.\n"
+            "Откройте маршрут кнопкой `R-...` и нажмите *Подписаться на маршрут*."
+        )
+        return
+
+    for sub in subs:
+        await send_message_safely(
+            message.chat.id,
+            render_route_subscription(sub),
+            reply_markup=subscription_actions_keyboard(sub["id"], sub["route_id"])
+        )
+
+@router.message(Command("unsubscribe_route"))
+async def cmd_unsubscribe_route(message: types.Message):
+    args = (message.text or "").split()
+    if len(args) < 2:
+        await message.answer("Использование: `/unsubscribe_route <ID подписки>`")
+        return
+    try:
+        subscription_id = int(args[1])
+    except ValueError:
+        await message.answer("❌ Неверный ID подписки.")
+        return
+    changed = await asyncio.to_thread(deactivate_route_subscription, subscription_id, message.from_user.id)
+    await message.answer("✅ Подписка отключена." if changed else "Не нашел активную подписку с таким ID.")
 
 @router.message(lambda msg: msg.text and msg.text.startswith("/del_"))
 async def cmd_delete_search(message: types.Message):
@@ -998,24 +1244,58 @@ async def cmd_route_details(message: types.Message):
 
     metadata = json.loads(row.get("metadata_json") or "{}")
     text = await _render_snapshot_routes([row], metadata)
-    await send_message_safely(message.chat.id, "📌 *Детали маршрута*\n\n" + text)
+    await send_message_safely(
+        message.chat.id,
+        "📌 *Детали маршрута*\n\n" + text,
+        reply_markup=route_actions_keyboard(row.get("search_id"), route_id)
+    )
 
-@router.message(Command("refresh_route"))
-async def cmd_refresh_route(message: types.Message):
+@router.message(Command("diagnose_search"))
+async def cmd_diagnose_search(message: types.Message):
+    args = (message.text or "").split()
+    search_id = None
+    if len(args) >= 2:
+        try:
+            search_id = int(args[1])
+        except ValueError:
+            await message.answer("Неверный ID поиска. Пример: `/diagnose_search 12`")
+            return
+
+    snapshot = await asyncio.to_thread(get_latest_search_snapshot, message.from_user.id, search_id)
+    if not snapshot:
+        await message.answer("Пока нет сохраненного результата для диагностики. Запустите поиск или `/refresh_search <id>`.")
+        return
+
+    await send_message_safely(
+        message.chat.id,
+        render_search_diagnostics(snapshot),
+        reply_markup=result_actions_keyboard(snapshot.get("search_id"), [], 5, "balanced")
+    )
+
+@router.message(Command("why_route", "diagnose_route"))
+async def cmd_why_route(message: types.Message):
     route_id, search_id = _parse_route_command_args(message.text or "")
     if not route_id:
-        await message.answer("Укажите route_id: `/refresh_route R-ABC123`\nМожно уточнить поиск: `/refresh_route R-ABC123 12`")
+        await message.answer("Укажите route_id: `/why_route R-ABC123`\nМожно уточнить поиск: `/why_route R-ABC123 12`")
         return
 
     row = await asyncio.to_thread(get_route_snapshot, message.from_user.id, route_id, search_id)
     if not row:
-        await message.answer("Не нашел такой маршрут в ваших последних результатах. Проверьте route_id или запустите поиск заново.")
+        await message.answer("Не нашел такой маршрут в ваших сохраненных результатах.")
         return
 
+    snapshot = await asyncio.to_thread(get_latest_search_snapshot, message.from_user.id, row.get("search_id"))
+    await send_message_safely(
+        message.chat.id,
+        render_route_diagnostics(row, snapshot),
+        reply_markup=route_actions_keyboard(row.get("search_id"), route_id)
+    )
+
+async def refresh_route_snapshot(chat_id: int, row: dict, route_id: str):
     route = json.loads(row["route_json"])
     refreshed_segments = []
     refresh_warnings = []
-    status_msg = await message.answer(f"🔄 Обновляю цены по маршруту `{route_id}`...")
+    status_msg = await bot.send_message(chat_id, f"🔄 Обновляю цены по маршруту `{route_id}`...")
 
     for leg in route.get("segments", []):
         if leg.get("is_manual"):
@@ -1066,7 +1346,68 @@ async def cmd_refresh_route(message: types.Message):
         await status_msg.delete()
     except Exception:
         pass
-    await send_message_safely(message.chat.id, "✅ *Маршрут обновлен точечно*\n\n" + text)
+    await send_message_safely(
+        chat_id,
+        "✅ *Маршрут обновлен точечно*\n\n" + text,
+        reply_markup=route_actions_keyboard(row.get("search_id"), route_id)
+    )
+
+async def refresh_route_data(route: dict, cache_mode: str = "fresh") -> tuple[dict, bool, list[str]]:
+    refreshed_segments = []
+    refresh_warnings = []
+    partial_data = False
+
+    for leg in route.get("segments", []):
+        if leg.get("is_manual"):
+            refreshed_segments.append(leg)
+            continue
+
+        date = leg.get("depart_date", leg.get("departure_at", "")[:10])
+        failed_before = provider.rate_limiter.stats.get("failed_requests", 0)
+        fresh_options = await provider.get_prices(
+            leg["origin"],
+            leg["destination"],
+            date,
+            direct_only=True,
+            cache_mode=cache_mode
+        )
+        if provider.rate_limiter.stats.get("failed_requests", 0) > failed_before:
+            partial_data = True
+
+        same_day_options = [item for item in fresh_options if item.get("depart_date") == date]
+        options = same_day_options or fresh_options
+        if not options:
+            refreshed_segments.append(leg)
+            refresh_warnings.append(f"{leg['origin']} -> {leg['destination']} на {date}: свежая цена не найдена, оставил старую.")
+            partial_data = True
+            continue
+
+        best = sorted(options, key=lambda item: item.get("price", 0))[0]
+        refreshed_segments.append(best)
+
+    refreshed_route = dict(route)
+    refreshed_route["segments"] = refreshed_segments
+    refreshed_route["base_price"] = sum(float(leg.get("price", 0)) for leg in refreshed_segments)
+    refreshed_route["total_price"] = refreshed_route["base_price"] + float(refreshed_route.get("lodging_price", 0))
+    refreshed_route["badges"] = ["Свежая проверка"] + [b for b in route.get("badges", []) if b != "Свежая проверка"]
+    if refresh_warnings:
+        refreshed_route["risk_warnings"] = list(route.get("risk_warnings", [])) + refresh_warnings
+    return refreshed_route, partial_data, refresh_warnings
+
+@router.message(Command("refresh_route"))
+async def cmd_refresh_route(message: types.Message):
+    route_id, search_id = _parse_route_command_args(message.text or "")
+    if not route_id:
+        await message.answer("Укажите route_id: `/refresh_route R-ABC123`\nМожно уточнить поиск: `/refresh_route R-ABC123 12`")
+        return
+
+    row = await asyncio.to_thread(get_route_snapshot, message.from_user.id, route_id, search_id)
+    if not row:
+        await message.answer("Не нашел такой маршрут в ваших последних результатах. Проверьте route_id или запустите поиск заново.")
+        return
+
+    await refresh_route_snapshot(message.chat.id, row, route_id)
+    return
 
 @router.message(Command("check_route", "check_segment"))
 async def cmd_check_route(message: types.Message):
@@ -1091,7 +1432,7 @@ async def cmd_check_route(message: types.Message):
         await message.answer("❌ Укажите IATA-коды из 3 букв, например `UFA MOW`.")
         return
 
-    status_msg = await message.answer(f"🔎 Проверяю свежие цены `{origin}` -> `{destination}` на {depart_date}...")
+    status_msg = await message.answer(f"🔎 Проверяю свежие цены `{format_iata_city(origin)}` -> `{format_iata_city(destination)}` на {depart_date}...")
     options = await provider.get_prices(origin, destination, depart_date, direct_only=True, cache_mode="fresh")
     same_day_options = [item for item in options if item.get("depart_date") == depart_date]
     options = sorted(same_day_options or options, key=lambda item: item.get("price", 0))[:5]
@@ -1103,12 +1444,12 @@ async def cmd_check_route(message: types.Message):
 
     if not options:
         await message.answer(
-            f"Не нашел свежих прямых вариантов `{origin}` -> `{destination}` на {depart_date}.\n"
+            f"Не нашел свежих прямых вариантов `{format_iata_city(origin)}` -> `{format_iata_city(destination)}` на {depart_date}.\n"
             "Если Aviasales показывает билет, возможно это чартер/агентский остаток, непрямой рейс или данные API еще не обновились."
         )
         return
 
-    lines = [f"🔎 *Свежая проверка сегмента* `{origin}` -> `{destination}` на {depart_date}\n"]
+    lines = [f"🔎 *Свежая проверка сегмента* `{format_iata_city(origin)}` -> `{format_iata_city(destination)}` на {depart_date}\n"]
     for index, option in enumerate(options, start=1):
         price = float(option.get("price", 0) or 0)
         departure_at = option.get("departure_at") or option.get("depart_date") or depart_date
@@ -1144,7 +1485,12 @@ async def cmd_more_routes(message: types.Message):
         f"\n\nПоказаны варианты с offset={offset}, сортировка: {sort_mode}."
         f"\nЕще: `/more_routes offset={next_offset} {sort_mode}`"
     )
-    await send_message_safely(message.chat.id, text)
+    routes = [json.loads(row["route_json"]) for row in rows]
+    await send_message_safely(
+        message.chat.id,
+        text,
+        reply_markup=result_actions_keyboard(snapshot.get("search_id"), routes, next_offset, sort_mode)
+    )
 
 async def _send_sorted_routes(message: types.Message, sort_mode: str):
     snapshot, rows = await asyncio.to_thread(get_snapshot_routes, message.from_user.id, None, 0, 5, sort_mode)
@@ -1157,7 +1503,12 @@ async def _send_sorted_routes(message: types.Message, sort_mode: str):
     metadata = json.loads(snapshot.get("metadata_json") or "{}")
     text = await _render_snapshot_routes(rows, metadata)
     text += f"\n\nСортировка: {sort_mode}. Еще: `/more_routes offset=5 {sort_mode}`"
-    await send_message_safely(message.chat.id, text)
+    routes = [json.loads(row["route_json"]) for row in rows]
+    await send_message_safely(
+        message.chat.id,
+        text,
+        reply_markup=result_actions_keyboard(snapshot.get("search_id"), routes, 5, sort_mode)
+    )
 
 @router.message(Command("routes_by_price"))
 async def cmd_routes_by_price(message: types.Message):
@@ -1174,6 +1525,164 @@ async def cmd_routes_by_comfort(message: types.Message):
 @router.message(Command("routes_by_stopover"))
 async def cmd_routes_by_stopover(message: types.Message):
     await _send_sorted_routes(message, "stopover")
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("more:"))
+async def cb_more_routes(callback: types.CallbackQuery):
+    _, sid_raw, offset_raw, sort_mode = callback.data.split(":", 3)
+    search_id = _callback_search_id(sid_raw)
+    try:
+        offset = max(0, int(offset_raw))
+    except ValueError:
+        offset = 5
+    snapshot, rows = await asyncio.to_thread(get_snapshot_routes, callback.from_user.id, search_id, offset, 5, sort_mode)
+    if not snapshot or not rows:
+        await callback.answer("Больше маршрутов нет", show_alert=False)
+        return
+    metadata = json.loads(snapshot.get("metadata_json") or "{}")
+    text = await _render_snapshot_routes(rows, metadata)
+    next_offset = offset + len(rows)
+    routes = [json.loads(row["route_json"]) for row in rows]
+    await callback.answer()
+    await send_message_safely(
+        callback.message.chat.id,
+        text,
+        reply_markup=result_actions_keyboard(snapshot.get("search_id"), routes, next_offset, sort_mode)
+    )
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("sort:"))
+async def cb_sort_routes(callback: types.CallbackQuery):
+    _, sid_raw, sort_mode = callback.data.split(":", 2)
+    search_id = _callback_search_id(sid_raw)
+    snapshot, rows = await asyncio.to_thread(get_snapshot_routes, callback.from_user.id, search_id, 0, 5, sort_mode)
+    if not snapshot or not rows:
+        await callback.answer("Нет сохраненных маршрутов", show_alert=False)
+        return
+    metadata = json.loads(snapshot.get("metadata_json") or "{}")
+    text = await _render_snapshot_routes(rows, metadata)
+    routes = [json.loads(row["route_json"]) for row in rows]
+    await callback.answer()
+    await send_message_safely(
+        callback.message.chat.id,
+        text,
+        reply_markup=result_actions_keyboard(snapshot.get("search_id"), routes, 5, sort_mode)
+    )
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("route:"))
+async def cb_route_details(callback: types.CallbackQuery):
+    _, sid_raw, route_id = callback.data.split(":", 2)
+    search_id = _callback_search_id(sid_raw)
+    row = await asyncio.to_thread(get_route_snapshot, callback.from_user.id, route_id, search_id)
+    if not row:
+        await callback.answer("Маршрут не найден", show_alert=True)
+        return
+    metadata = json.loads(row.get("metadata_json") or "{}")
+    text = await _render_snapshot_routes([row], metadata)
+    await callback.answer()
+    await send_message_safely(
+        callback.message.chat.id,
+        "📌 *Детали маршрута*\n\n" + text,
+        reply_markup=route_actions_keyboard(row.get("search_id"), route_id)
+    )
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("diag:"))
+async def cb_diagnose_search(callback: types.CallbackQuery):
+    _, sid_raw = callback.data.split(":", 1)
+    search_id = _callback_search_id(sid_raw)
+    snapshot = await asyncio.to_thread(get_latest_search_snapshot, callback.from_user.id, search_id)
+    if not snapshot:
+        await callback.answer("Диагностика пока недоступна", show_alert=True)
+        return
+    await callback.answer()
+    await send_message_safely(
+        callback.message.chat.id,
+        render_search_diagnostics(snapshot),
+        reply_markup=result_actions_keyboard(snapshot.get("search_id"), [], 5, "balanced")
+    )
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("why_route:"))
+async def cb_why_route(callback: types.CallbackQuery):
+    _, sid_raw, route_id = callback.data.split(":", 2)
+    search_id = _callback_search_id(sid_raw)
+    row = await asyncio.to_thread(get_route_snapshot, callback.from_user.id, route_id, search_id)
+    if not row:
+        await callback.answer("Маршрут не найден", show_alert=True)
+        return
+    snapshot = await asyncio.to_thread(get_latest_search_snapshot, callback.from_user.id, row.get("search_id"))
+    await callback.answer()
+    await send_message_safely(
+        callback.message.chat.id,
+        render_route_diagnostics(row, snapshot),
+        reply_markup=route_actions_keyboard(row.get("search_id"), route_id)
+    )
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("refresh_route:"))
+async def cb_refresh_route(callback: types.CallbackQuery):
+    _, sid_raw, route_id = callback.data.split(":", 2)
+    search_id = _callback_search_id(sid_raw)
+    row = await asyncio.to_thread(get_route_snapshot, callback.from_user.id, route_id, search_id)
+    if not row:
+        await callback.answer("Маршрут не найден", show_alert=True)
+        return
+    await callback.answer("Обновляю маршрут")
+    await refresh_route_snapshot(callback.message.chat.id, row, route_id)
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("subroute:"))
+async def cb_subscribe_route(callback: types.CallbackQuery):
+    _, sid_raw, route_id = callback.data.split(":", 2)
+    search_id = _callback_search_id(sid_raw)
+    sub = await asyncio.to_thread(
+        subscribe_route,
+        callback.from_user.id,
+        callback.message.chat.id,
+        route_id,
+        search_id,
+        None
+    )
+    if not sub:
+        await callback.answer("Маршрут не найден", show_alert=True)
+        return
+    await callback.answer("Подписка включена", show_alert=False)
+    await send_message_safely(
+        callback.message.chat.id,
+        "✅ *Подписка на маршрут включена*\n\n" + render_route_subscription(sub),
+        reply_markup=subscription_actions_keyboard(sub["id"], sub["route_id"])
+    )
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("unsubroute:"))
+async def cb_unsubscribe_route(callback: types.CallbackQuery):
+    _, sub_id_raw = callback.data.split(":", 1)
+    try:
+        subscription_id = int(sub_id_raw)
+    except ValueError:
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+    changed = await asyncio.to_thread(deactivate_route_subscription, subscription_id, callback.from_user.id)
+    await callback.answer("Подписка отключена" if changed else "Подписка не найдена", show_alert=False)
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("refresh_sub:"))
+async def cb_refresh_subscription(callback: types.CallbackQuery):
+    _, sub_id_raw, route_id = callback.data.split(":", 2)
+    try:
+        subscription_id = int(sub_id_raw)
+    except ValueError:
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+    subs = await asyncio.to_thread(get_user_route_subscriptions, callback.from_user.id)
+    sub = next((item for item in subs if int(item["id"]) == subscription_id), None)
+    if not sub:
+        await callback.answer("Подписка не найдена", show_alert=True)
+        return
+    row = {
+        "route_json": sub["route_json"],
+        "route_id": route_id,
+        "search_id": sub.get("search_id"),
+        "origin_iata": sub.get("origin_iata", ""),
+        "destination_text": sub.get("destination_text", ""),
+        "date_start": sub.get("date_start", ""),
+        "date_end": sub.get("date_end", ""),
+    }
+    await callback.answer("Обновляю маршрут")
+    await refresh_route_snapshot(callback.message.chat.id, row, route_id)
 
 # Logic execution & background task
 async def run_single_search_and_send(user_id: int, chat_id: int, search_config: dict, is_monitor_job: bool = False):
@@ -1243,6 +1752,7 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
 
     # Run dynamic bidirectional discovery, caching topology separately from prices.
     discovery_cache_hit = False
+    discovery_diagnostics = {}
     candidate_edges = await asyncio.to_thread(
         get_discovery_cache,
         origin,
@@ -1256,7 +1766,7 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         logger.info(f"Discovery cache hit: {len(candidate_edges)} edges for {origin} -> {destination_country}")
     else:
         try:
-            candidate_edges = await discovery_service.discover_candidate_edges(
+            candidate_edges, discovery_diagnostics = await discovery_service.discover_candidate_edges_with_diagnostics(
                 origin=origin,
                 destination_country=destination_country,
                 destination_iatas=destination_iatas,
@@ -1349,6 +1859,11 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
             pass
 
     # Level 2: Solve DAG & Scorer (Codex E: pass priced_flights in memory)
+    priced_edges = {
+        (flight.get("origin"), flight.get("destination"))
+        for flight in priced_flights
+        if flight.get("origin") and flight.get("destination")
+    }
     solved_data = solver.solve(
         origin_iata=origin,
         destination_country_code=destination_country,
@@ -1384,10 +1899,15 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         "hubs": list(explored_hubs),
         "segments_count": len(candidate_edges),
         "priced_segments_count": len(priced_flights),
+        "priced_edges_count": len(priced_edges),
+        "unpriced_candidate_edges_count": max(len(candidate_edges) - len(priced_edges), 0),
         "total_routes_found": solved_data.get("total_routes_found_before_filter", 0),
+        "total_routes_scored": solved_data.get("total_routes_scored", 0),
         "total_routes_after_filter": solved_data.get("total_routes_after_filter", 0),
         "rendered_routes_count": solved_data.get("rendered_routes_count", 0),
+        "route_cap_hit": solved_data.get("route_cap_hit", False),
         "discovery_cache_hit": discovery_cache_hit,
+        "discovery_diagnostics": discovery_diagnostics,
         "is_fallback_active": solved_data.get("is_fallback_active", False),
         "max_transfers": max_transfers,
         "destination_iatas": destination_iatas,
@@ -1422,12 +1942,8 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
     )
     if solved_data.get("recommended"):
         analysis_text += (
-            "\n\n📎 *Команды по результату:*"
-            "\n`/route R-XXXXXX` — детали маршрута"
-            "\n`/refresh_route R-XXXXXX` — обновить цены этого маршрута"
-            "\n`/check_route UFA MOW 2026-06-10` — свежая проверка сегмента"
-            "\n`/more_routes` — следующие 5 вариантов"
-            "\n`/routes_by_price` / `/routes_by_duration` — пересортировать сохраненный результат"
+            "\n\n📎 *Действия доступны кнопками ниже.* "
+            "Команды также есть в меню Telegram."
         )
 
     # Delete status message before sending final report
@@ -1476,8 +1992,12 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
                     + analysis_text
                 )
 
+        reply_markup = None
+        if solved_data.get("recommended") and not is_monitor_job:
+            reply_markup = result_actions_keyboard(search_id, solved_data.get("recommended", []), 5, "balanced")
+
         # Send safe and split message (DOP-4)
-        await send_message_safely(chat_id, analysis_text)
+        await send_message_safely(chat_id, analysis_text, reply_markup=reply_markup)
         return best_price
     except Exception as e:
         logger.error(f"Failed to send telegram message: {e}")
@@ -1492,48 +2012,91 @@ async def run_search_and_update_baseline(user_id: int, chat_id: int, search_conf
 
 # Scheduler job
 async def run_daily_monitoring_job():
-    logger.info("Starting scheduled flight monitoring job...")
-    searches = await asyncio.to_thread(get_all_active_searches)
-    for s in searches:
-        logger.info(f"Processing monitoring search ID {s['id']} for user {s['user_id']}")
-        config_data = {
-            "search_id": s["id"],
-            "last_checked_price": s["last_checked_price"],
-            "price_drop_threshold_pct": s.get("price_drop_threshold_pct", DEFAULT_PRICE_DROP_THRESHOLD_PCT),
-            "origin_iata": s["origin_iata"],
-            "dest_iata": s["destination_text"],
-            "date_start": s["date_start"],
-            "date_end": s["date_end"],
-            "max_budget": s["max_budget"],
-            "max_transfers": s.get("max_transfers", 2),
-            "lodging_exceptions": json.loads(s.get("lodging_exceptions_json", "{}")),
-            "stopovers": json.loads(s.get("stopovers_json", "[]")),
-            "exclusions": json.loads(s.get("exclusions_json", "[]")),
-            "baggage_needed": s.get("baggage_needed", 0),
-            "cache_mode": "monitor",
-            "stopover_preset": s.get("stopover_preset", "balanced"),
-            "min_stopover_hours": s.get("min_stopover_hours", 0),
-            "max_stopover_days": s.get("max_stopover_days", 5),
-            "allow_awkward_layovers": s.get("allow_awkward_layovers", 1),
-            "visa_mode": s.get("visa_mode", "visa_free_only")
-        }
+    logger.info("Starting scheduled route-subscription monitoring job...")
+    subscriptions = await asyncio.to_thread(get_all_active_route_subscriptions)
+    for sub in subscriptions:
+        logger.info("Processing route subscription ID %s (%s)", sub["id"], sub["route_id"])
+        try:
+            route = json.loads(sub.get("route_json") or "{}")
+            if not route:
+                continue
 
-        # Run search with monitor flag active (DOP-2)
-        best_price = await run_single_search_and_send(s["user_id"], s["chat_id"], config_data, is_monitor_job=True)
+            refreshed_route, partial_data, _ = await refresh_route_data(route, cache_mode="monitor")
+            current_price = float(refreshed_route.get("total_price") or 0)
+            decision = price_drop_alert_decision(
+                last_price=sub.get("last_checked_price", 0),
+                current_price=current_price,
+                threshold_pct=sub.get("price_drop_threshold_pct", DEFAULT_PRICE_DROP_THRESHOLD_PCT),
+                partial_data=partial_data,
+            )
 
-        # Update last checked price (async-safe thread)
-        if best_price > 0:
-            await asyncio.to_thread(update_last_checked_price, s["id"], best_price)
+            if not decision["should_update_baseline"]:
+                logger.info(
+                    "Subscription %s skipped baseline update: %s",
+                    sub["id"],
+                    decision["reason"],
+                )
+                continue
 
-        await asyncio.sleep(5.0) # Gap between users to reduce rate load
+            if decision["should_alert"]:
+                old_price = float(sub.get("last_checked_price") or 0)
+                text = await analyst.analyze_routes(
+                    origin=sub.get("origin_iata", ""),
+                    destination=sub.get("destination_text", ""),
+                    date_range=f"{sub.get('date_start', '')} — {sub.get('date_end', '')}",
+                    max_budget=0,
+                    solved_data={
+                        "recommended": [refreshed_route],
+                        "is_fallback_active": False,
+                        "total_routes_after_filter": 1,
+                        "rendered_routes_count": 1
+                    },
+                    search_metadata=None
+                )
+                header = (
+                    f"🔔 *Цена выбранного маршрута упала на {decision['drop_pct']:.1f}%*\n"
+                    f"Маршрут: `{sub['route_id']}`\n"
+                    f"Было: {old_price:,.0f} ₽\n"
+                    f"Стало: {current_price:,.0f} ₽\n"
+                    f"Порог: {decision['threshold_pct']:.1f}%\n\n"
+                )
+                await send_message_safely(
+                    sub["chat_id"],
+                    header + text,
+                    reply_markup=subscription_actions_keyboard(sub["id"], sub["route_id"])
+                )
+
+            await asyncio.to_thread(update_route_subscription_baseline, sub["id"], current_price)
+        except Exception as e:
+            logger.error("Route subscription monitoring failed for ID %s: %s", sub.get("id"), e)
+
+        await asyncio.sleep(5.0) # Gap between subscriptions to reduce rate load
 
 # Scheduler triggers configuration
+async def setup_bot_commands():
+    await bot.set_my_commands([
+        types.BotCommand(command="new_search", description="Новый мониторинг маршрута"),
+        types.BotCommand(command="my_searches", description="Активные мониторинги"),
+        types.BotCommand(command="refresh_search", description="Пересчитать поиск"),
+        types.BotCommand(command="route", description="Детали маршрута"),
+        types.BotCommand(command="subscribe_route", description="Подписаться на маршрут"),
+        types.BotCommand(command="my_route_alerts", description="Мои подписки на маршруты"),
+        types.BotCommand(command="unsubscribe_route", description="Отключить подписку"),
+        types.BotCommand(command="why_route", description="Почему маршрут так оценен"),
+        types.BotCommand(command="diagnose_search", description="Диагностика поиска"),
+        types.BotCommand(command="check_route", description="Проверить прямой сегмент"),
+        types.BotCommand(command="set_price_alert", description="Настроить порог падения цены"),
+        types.BotCommand(command="cancel", description="Отменить настройку"),
+    ])
+    logger.info("Telegram command menu updated.")
+
 def setup_scheduler():
     scheduler.add_job(run_daily_monitoring_job, 'cron', hour=10, minute=0)
     scheduler.start()
     logger.info("Scheduler setup complete. Daily job scheduled at 10:00.")
 
 async def main():
+    await setup_bot_commands()
     setup_scheduler()
     logger.info("Starting Telegram Bot long-polling...")
     await dp.start_polling(bot)

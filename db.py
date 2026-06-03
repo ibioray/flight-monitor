@@ -7,7 +7,9 @@ from config import DATABASE_PATH
 
 logger = logging.getLogger("db")
 
-QUERY_LOG_PROVIDER = "travelpayouts_prices_for_dates_v3"
+DISCOVERY_CACHE_VERSION = "layered_mitm_v2"
+
+QUERY_LOG_PROVIDER = "travelpayouts_prices_for_dates_v4"
 QUERY_LOG_CURRENCY = "rub"
 QUERY_LOG_ONE_WAY = 1
 QUERY_LOG_MARKET = ""
@@ -321,6 +323,34 @@ def init_db():
         PRIMARY KEY (origin, destination_country, destination_iatas_hash, months_hash, max_transfers)
     )
     """)
+
+    # 8. Route-level price subscriptions. A search can be one-off; monitoring is attached
+    # only to selected route snapshots.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS route_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        search_id INTEGER,
+        snapshot_id INTEGER NOT NULL,
+        route_id TEXT NOT NULL,
+        route_json TEXT NOT NULL,
+        origin_iata TEXT NOT NULL,
+        destination_text TEXT NOT NULL,
+        date_start TEXT NOT NULL,
+        date_end TEXT NOT NULL,
+        price_drop_threshold_pct REAL DEFAULT 10,
+        last_checked_price REAL DEFAULT 0,
+        last_checked_at TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, search_id, route_id),
+        FOREIGN KEY(user_id) REFERENCES users(user_id),
+        FOREIGN KEY(search_id) REFERENCES user_searches(id),
+        FOREIGN KEY(snapshot_id) REFERENCES search_snapshots(id)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_route_subscriptions_active ON route_subscriptions(is_active, user_id, route_id)")
     
     conn.commit()
     
@@ -476,6 +506,124 @@ def update_price_drop_threshold(search_id: int, user_id: int, threshold_pct: flo
     conn.close()
     return changed
 
+def subscribe_route(user_id: int, chat_id: int, route_id: str, search_id: int | None = None,
+                    threshold_pct: float | None = None) -> dict | None:
+    route_row = get_route_snapshot(user_id, route_id, search_id)
+    if not route_row:
+        return None
+
+    route = json.loads(route_row["route_json"])
+    baseline = float(route.get("total_price") or route_row.get("route_price") or 0)
+    checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    sub_search_id = route_row.get("search_id")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    threshold = threshold_pct
+    if threshold is None and sub_search_id:
+        cursor.execute("SELECT price_drop_threshold_pct FROM user_searches WHERE id = ? AND user_id = ?", (sub_search_id, user_id))
+        search_row = cursor.fetchone()
+        if search_row:
+            threshold = search_row["price_drop_threshold_pct"]
+    threshold = float(threshold or 10.0)
+    cursor.execute("""
+    INSERT INTO route_subscriptions (
+        user_id, chat_id, search_id, snapshot_id, route_id, route_json,
+        origin_iata, destination_text, date_start, date_end,
+        price_drop_threshold_pct, last_checked_price, last_checked_at, is_active
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(user_id, search_id, route_id) DO UPDATE SET
+        chat_id = excluded.chat_id,
+        snapshot_id = excluded.snapshot_id,
+        route_json = excluded.route_json,
+        origin_iata = excluded.origin_iata,
+        destination_text = excluded.destination_text,
+        date_start = excluded.date_start,
+        date_end = excluded.date_end,
+        price_drop_threshold_pct = excluded.price_drop_threshold_pct,
+        last_checked_price = excluded.last_checked_price,
+        last_checked_at = excluded.last_checked_at,
+        is_active = 1
+    """, (
+        user_id,
+        chat_id,
+        sub_search_id,
+        route_row["snapshot_id"],
+        route_row["route_id"],
+        route_row["route_json"],
+        route_row.get("origin_iata", ""),
+        route_row.get("destination_text", ""),
+        route_row.get("date_start", ""),
+        route_row.get("date_end", ""),
+        threshold,
+        baseline,
+        checked_at,
+    ))
+    conn.commit()
+    if sub_search_id is None:
+        cursor.execute("""
+        SELECT * FROM route_subscriptions
+        WHERE user_id = ? AND search_id IS NULL AND route_id = ?
+        """, (user_id, route_row["route_id"]))
+    else:
+        cursor.execute("""
+        SELECT * FROM route_subscriptions
+        WHERE user_id = ? AND search_id = ? AND route_id = ?
+        """, (user_id, sub_search_id, route_row["route_id"]))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_user_route_subscriptions(user_id: int) -> list[dict]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT * FROM route_subscriptions
+    WHERE user_id = ? AND is_active = 1
+    ORDER BY created_at DESC, id DESC
+    """, (user_id,))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_all_active_route_subscriptions() -> list[dict]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT * FROM route_subscriptions
+    WHERE is_active = 1
+    ORDER BY id ASC
+    """)
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def update_route_subscription_baseline(subscription_id: int, price: float):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    UPDATE route_subscriptions
+    SET last_checked_price = ?, last_checked_at = ?
+    WHERE id = ?
+    """, (price, checked_at, subscription_id))
+    conn.commit()
+    conn.close()
+
+def deactivate_route_subscription(subscription_id: int, user_id: int) -> bool:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE route_subscriptions
+    SET is_active = 0
+    WHERE id = ? AND user_id = ?
+    """, (subscription_id, user_id))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
 def _unique_routes_for_snapshot(solved_data: dict) -> list[dict]:
     routes = []
     seen = set()
@@ -606,6 +754,9 @@ def _stable_hash(values: list[str]) -> str:
     payload = json.dumps(sorted(values), ensure_ascii=False)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
+def _versioned_discovery_destination(destination_country: str) -> str:
+    return f"{destination_country}::{DISCOVERY_CACHE_VERSION}"
+
 def get_discovery_cache(origin: str, destination_country: str, destination_iatas: list[str], months: list[str],
                         max_transfers: int, ttl_hours: int = 24) -> set[tuple[str, str]] | None:
     conn = get_db_connection()
@@ -618,7 +769,7 @@ def get_discovery_cache(origin: str, destination_country: str, destination_iatas
     AND datetime(created_at) >= datetime('now', ?)
     """, (
         origin,
-        destination_country,
+        _versioned_discovery_destination(destination_country),
         _stable_hash(destination_iatas),
         _stable_hash(months),
         max_transfers,
@@ -651,7 +802,7 @@ def save_discovery_cache(origin: str, destination_country: str, destination_iata
         created_at = excluded.created_at
     """, (
         origin,
-        destination_country,
+        _versioned_discovery_destination(destination_country),
         _stable_hash(destination_iatas),
         _stable_hash(months),
         max_transfers,
@@ -742,6 +893,22 @@ def get_cached_flights(origin: str, destination: str, month: str, direct_only: i
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+def clear_flight_cache_for_route_month(origin: str, destination: str, month: str, direct_only: int | None = None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if direct_only is None:
+        cursor.execute("""
+        DELETE FROM flight_cache
+        WHERE origin = ? AND destination = ? AND depart_date LIKE ?
+        """, (origin, destination, f"{month}%"))
+    else:
+        cursor.execute("""
+        DELETE FROM flight_cache
+        WHERE origin = ? AND destination = ? AND depart_date LIKE ? AND direct_only = ?
+        """, (origin, destination, f"{month}%", direct_only))
+    conn.commit()
+    conn.close()
 
 def save_flight_cache(origin: str, destination: str, depart_date: str, departure_at: str, price: float, 
                       airline: str, flight_number: str, transfers_count: int, duration: int, direct_only: int,

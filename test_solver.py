@@ -17,12 +17,15 @@ config.DATABASE_PATH = TEST_DB_PATH
 from db import (
     init_db, save_flight_cache, save_search_snapshot,
     get_route_snapshot, get_snapshot_routes, save_discovery_cache,
-    get_discovery_cache, get_user_searches
+    get_discovery_cache, get_user_searches, subscribe_route,
+    get_user_route_subscriptions, deactivate_route_subscription
 )
 from solver import GraphSolver
 from analyst import LLMCognitiveAnalyst
 from discovery import RouteDiscoveryService
 from monitoring import price_drop_alert_decision
+from providers import _absolute_aviasales_link, _parse_changes_count
+from airport_names import format_iata_city
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("test_solver")
@@ -185,7 +188,14 @@ async def run_test():
 
     for route in results["recommended"]:
         assert route["route_id"] in analysis_report, "Deterministic analysis must render every recommended route."
+    assert "ALA (Алматы)" in analysis_report, "Renderer should show city names next to IATA codes."
+    assert "URC (Урумчи)" in analysis_report, "Renderer should show destination city names next to IATA codes."
+    assert format_iata_city("KJA") == "KJA (Красноярск)", "KJA should be labeled as Krasnoyarsk."
     assert "###" not in analysis_report and "**" not in analysis_report, "Telegram report must not use headings or double-star Markdown."
+    assert _parse_changes_count({"transfers": 0}) == 0
+    assert _parse_changes_count({"number_of_changes": 1}) == 1
+    assert _parse_changes_count({}) is None
+    assert _absolute_aviasales_link("/search/UFA0306KJA1") == "https://www.aviasales.ru/search/UFA0306KJA1"
 
     renderer_probe = dict(results["recommended"][0])
     renderer_probe["badges"] = ["Тест ## badge"]
@@ -216,6 +226,15 @@ async def run_test():
     route_row = get_route_snapshot(42, first_route_id)
     assert route_row is not None, "Route snapshot should be retrievable by route_id."
     assert json.loads(route_row["route_json"])["route_id"] == first_route_id
+
+    sub = subscribe_route(42, 4242, first_route_id, search_id=7, threshold_pct=8)
+    assert sub is not None, "Route subscription should be created from a saved route snapshot."
+    assert sub["route_id"] == first_route_id
+    assert float(sub["last_checked_price"]) == results["recommended"][0]["total_price"]
+    route_subs = get_user_route_subscriptions(42)
+    assert len(route_subs) == 1 and route_subs[0]["route_id"] == first_route_id
+    assert deactivate_route_subscription(sub["id"], 42), "Route subscription should be deactivated by owner."
+    assert not get_user_route_subscriptions(42), "Inactive route subscriptions should be hidden."
 
     snapshot, price_rows = get_snapshot_routes(42, sort_mode="price")
     assert snapshot is not None and len(price_rows) >= 5, "Snapshot routes should be pageable."
@@ -307,6 +326,53 @@ async def run_test():
     )
     assert cached_edges == edges, "Discovery cache should restore the same edge set with stable destination ordering."
     assert get_discovery_cache("UFA", "CN", ["PEK", "PVG", "URC"], ["2026-06"], max_transfers=2) is None, "Discovery cache must be separated by max_transfers."
+
+    # Discovery bridge edges must be target-specific, not a generic all-hubs mesh.
+    class TargetSpecificProvider:
+        async def get_outbound_directions(self, origin_code, month):
+            routes_by_origin = {
+                "UFA": [
+                    {"origin": "UFA", "destination": "ALA", "transfers": 0},
+                    {"origin": "UFA", "destination": "SCO", "transfers": 0},
+                ],
+                "ALA": [
+                    {"origin": "ALA", "destination": "HRB", "transfers": 0},
+                    {"origin": "ALA", "destination": "HAN", "transfers": 0},
+                ],
+                "SCO": [
+                    {"origin": "SCO", "destination": "HAN", "transfers": 0},
+                ],
+            }
+            return routes_by_origin.get(origin_code, [])
+
+        async def get_inbound_directions(self, destination_code, month):
+            routes_by_destination = {
+                "URC": [{"origin": "HRB", "destination": "URC", "transfers": 0}],
+                "SGN": [{"origin": "HAN", "destination": "SGN", "transfers": 0}],
+            }
+            return routes_by_destination.get(destination_code, [])
+
+    target_discovery = RouteDiscoveryService(TargetSpecificProvider())
+    cn_edges, cn_diag = await target_discovery.discover_candidate_edges_with_diagnostics(
+        origin="UFA",
+        destination_country="CN",
+        destination_iatas=["URC"],
+        months=["2026-06"],
+        max_transfers=2,
+    )
+    vn_edges, vn_diag = await target_discovery.discover_candidate_edges_with_diagnostics(
+        origin="UFA",
+        destination_country="VN",
+        destination_iatas=["SGN"],
+        months=["2026-06"],
+        max_transfers=2,
+    )
+    assert ("ALA", "HRB") in cn_edges, "China bridge should include ALA -> HRB."
+    assert ("ALA", "HAN") not in cn_edges, "China bridge should not include Vietnam-only target-side hub."
+    assert ("ALA", "HAN") in vn_edges and ("SCO", "HAN") in vn_edges, "Vietnam bridges should target HAN."
+    assert cn_edges != vn_edges, "Different target countries should not collapse into the same generic graph."
+    assert cn_diag["edge_categories"]["bridge"] == 1, "China bridge diagnostics should be precise."
+    assert vn_diag["edge_categories"]["bridge"] == 2, "Vietnam bridge diagnostics should be precise."
 
     # 7. Rate Limiter Test
     logger.info("Testing AsyncRateLimiter...")

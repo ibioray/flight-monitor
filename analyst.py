@@ -3,6 +3,7 @@ import json
 import httpx
 from datetime import datetime, timezone, timedelta
 from config import GEMINI_API_KEY, OPENROUTER_API_KEY
+from airport_names import annotate_iata_codes, format_iata_city
 
 logger = logging.getLogger("analyst")
 
@@ -116,13 +117,15 @@ class TelegramReportRenderer:
         if route.get("estimated_timing"):
             lines.append("Время части сегментов расчетное: перед покупкой обновить цены.")
         if route.get("risk_warnings"):
-            risks = [self.clean_text(risk) for risk in route["risk_warnings"][:2]]
+            risks = [self.clean_text(annotate_iata_codes(risk)) for risk in route["risk_warnings"][:2]]
             lines.append("Риски: " + "; ".join(risks))
         return lines
 
     def render_leg(self, leg: dict) -> str:
-        origin = self.clean_text(leg.get("origin"))
-        destination = self.clean_text(leg.get("destination"))
+        origin_code = self.clean_text(leg.get("origin"))
+        destination_code = self.clean_text(leg.get("destination"))
+        origin = self.clean_text(format_iata_city(origin_code))
+        destination = self.clean_text(format_iata_city(destination_code))
         date = self.clean_text(leg.get("depart_date", leg.get("departure_at", "")[:10]))
         price = self.money(leg.get("price"))
         transport = "поезд" if leg.get("is_manual") else "авиа"
@@ -133,11 +136,13 @@ class TelegramReportRenderer:
         age = ""
         if leg.get("fetched_at"):
             age = f", {format_price_age(leg.get('fetched_at'))}"
-        link = make_aviasales_link(origin, destination, date)
+        link = leg.get("booking_link") or make_aviasales_link(origin_code, destination_code, date)
         return f"{origin} -> {destination} ({date}, [{price} ₽]({link}), {transport}{age})"
 
     def render_stopover(self, stop: dict) -> str:
-        name = self.clean_text(stop.get("name", stop.get("city", "")))
+        city_code = self.clean_text(stop.get("city", ""))
+        raw_name = self.clean_text(stop.get("name", city_code))
+        name = raw_name if raw_name and raw_name != city_code else format_iata_city(city_code)
         layover_type = LAYOVER_TYPE_RU.get(stop.get("layover_type"), self.clean_text(stop.get("layover_type", "")))
         days = int(stop.get("days") or 0)
         if days > 0:
@@ -145,8 +150,8 @@ class TelegramReportRenderer:
         return f"{name} {stop.get('layover_hours', 0)} ч ({layover_type})"
 
     def render_transparency(self, solved_data: dict, routes: list[dict], search_metadata: dict) -> list[str]:
-        hubs_list = ", ".join(self.clean_text(hub) for hub in search_metadata.get("hubs", [])) or "нет транзитных хабов"
-        dests = ", ".join(self.clean_text(dest) for dest in search_metadata.get("destination_iatas", search_metadata.get("china_destinations", [])))
+        hubs_list = ", ".join(self.clean_text(format_iata_city(hub)) for hub in search_metadata.get("hubs", [])) or "нет транзитных хабов"
+        dests = ", ".join(self.clean_text(format_iata_city(dest)) for dest in search_metadata.get("destination_iatas", search_metadata.get("china_destinations", [])))
         visa_mode = VISA_MODE_RU.get(search_metadata.get("visa_mode", "visa_free_only"), search_metadata.get("visa_mode", "visa_free_only"))
         discovery_cache = "да" if search_metadata.get("discovery_cache_hit") else "нет"
         total_routes = search_metadata.get("total_routes_found", 0)
@@ -215,7 +220,7 @@ class LLMCognitiveAnalyst:
                     "price": f"{leg['price']:,.0f} ₽".replace(",", " "),
                     "airline": leg["airline"],
                     "type": "Поезд/Наземный" if leg.get("is_manual") else "Авиа",
-                    "booking_link": make_aviasales_link(leg["origin"], leg["destination"], leg["depart_date"]) if not leg.get("is_manual") else "Купить на вокзале"
+                    "booking_link": leg.get("booking_link") or make_aviasales_link(leg["origin"], leg["destination"], leg["depart_date"]) if not leg.get("is_manual") else "Купить на вокзале"
                 }
                 route_detail["legs"].append(leg_info)
 
@@ -370,7 +375,7 @@ class LLMCognitiveAnalyst:
             for index, r in enumerate(routes[:2]):
                 leg_desc = []
                 for leg in r["segments"]:
-                    link = make_aviasales_link(leg["origin"], leg["destination"], leg["depart_date"]) if not leg.get("is_manual") else None
+                    link = (leg.get("booking_link") or make_aviasales_link(leg["origin"], leg["destination"], leg["depart_date"])) if not leg.get("is_manual") else None
                     transport = "🚆 поезд" if leg.get("is_manual") else "✈️ самолет"
                     if link:
                         leg_desc.append(f"{leg['origin']} ➔ {leg['destination']} ({leg['depart_date']}, [{leg['price']:,.0f} ₽]({link}), {transport})")

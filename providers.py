@@ -8,6 +8,37 @@ from config import TRAVELPAYOUTS_TOKEN
 logger = logging.getLogger("providers")
 
 
+def _parse_api_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _parse_changes_count(item: dict) -> int | None:
+    for key in ("transfers", "number_of_changes"):
+        value = item.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _absolute_aviasales_link(raw_link: str | None) -> str | None:
+    if not raw_link:
+        return None
+    raw = str(raw_link)
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    if raw.startswith("/"):
+        return f"https://www.aviasales.ru{raw}"
+    return f"https://www.aviasales.ru/{raw}"
+
+
 class AsyncRateLimiter:
     """Token-bucket style rate limiter for async API calls.
 
@@ -81,7 +112,10 @@ class TravelpayoutsProvider(FlightProvider):
         Fetch cached flight prices for a route and a specific date or month.
         depart_month_or_date format: YYYY-MM or YYYY-MM-DD
         """
-        from db import check_route_query_log, log_route_query, get_cached_flights, save_flight_cache
+        from db import (
+            check_route_query_log, log_route_query, get_cached_flights,
+            save_flight_cache, clear_flight_cache_for_route_month
+        )
 
         month = depart_month_or_date[:7] # YYYY-MM
         direct_flag = 1 if direct_only else 0
@@ -160,15 +194,26 @@ class TravelpayoutsProvider(FlightProvider):
         logger.info(f"Found {len(data)} cached flights for {origin} -> {destination}")
 
         fetched_dt = datetime.now(timezone.utc)
-        fetched_at = fetched_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         # Calculate expires_at
         ttl_hours = 12 if cache_mode == "monitor" else 24
-        expires_dt = fetched_dt + timedelta(hours=ttl_hours)
-        expires_at = expires_dt.strftime("%Y-%m-%d %H:%M:%S")
+        fallback_expires_dt = fetched_dt + timedelta(hours=ttl_hours)
+
+        # Replace the route/month cache with the just-reviewed response. Otherwise an
+        # empty fresh response can leave a stale cheap segment visible for up to 24h.
+        await asyncio.to_thread(clear_flight_cache_for_route_month, origin, destination, month, direct_flag)
 
         parsed_flights = []
         for item in data:
+            item_origin = str(item.get("origin", "")).upper()
+            item_destination = str(item.get("destination", "")).upper()
+            if item_origin != origin.upper() or item_destination != destination.upper():
+                logger.warning(
+                    "Skipping mismatched Travelpayouts row: requested %s -> %s, got %s -> %s",
+                    origin, destination, item_origin, item_destination
+                )
+                continue
+
             departure_at = item.get("departure_at", item.get("depart_date") + "T00:00:00Z" if item.get("depart_date") else "")
             if not departure_at:
                 continue
@@ -176,19 +221,63 @@ class TravelpayoutsProvider(FlightProvider):
             depart_date = departure_at.split("T")[0]
             price_raw = item.get("price", item.get("value"))
             price = float(price_raw) if price_raw is not None else 0.0
+            if price <= 0:
+                continue
+
+            transfers_count = _parse_changes_count(item)
+            if direct_only and transfers_count != 0:
+                logger.warning(
+                    "Skipping non-direct or ambiguous row for direct query %s -> %s on %s: transfers=%s",
+                    origin, destination, depart_date, transfers_count
+                )
+                continue
+            if transfers_count is None:
+                transfers_count = 0
+
+            provider_expires_dt = _parse_api_datetime(item.get("expires_at"))
+            if provider_expires_dt:
+                if provider_expires_dt.tzinfo is None:
+                    provider_expires_dt = provider_expires_dt.replace(tzinfo=timezone.utc)
+                provider_expires_dt = provider_expires_dt.astimezone(timezone.utc)
+                if provider_expires_dt <= fetched_dt:
+                    logger.warning(
+                        "Skipping expired Travelpayouts price for %s -> %s on %s: expires_at=%s",
+                        origin, destination, depart_date, item.get("expires_at")
+                    )
+                    continue
+
+            provider_found_dt = _parse_api_datetime(item.get("found_at"))
+            if provider_found_dt:
+                if provider_found_dt.tzinfo is None:
+                    provider_found_dt = provider_found_dt.replace(tzinfo=timezone.utc)
+                provider_found_dt = provider_found_dt.astimezone(timezone.utc)
+                if provider_found_dt < fetched_dt - timedelta(hours=48):
+                    logger.warning(
+                        "Skipping stale Travelpayouts price older than 48h for %s -> %s on %s: found_at=%s",
+                        origin, destination, depart_date, item.get("found_at")
+                    )
+                    continue
+
+            fetched_at_dt = provider_found_dt or fetched_dt
+            expires_dt = provider_expires_dt or fallback_expires_dt
+            fetched_at = fetched_at_dt.strftime("%Y-%m-%d %H:%M:%S")
+            expires_at = expires_dt.strftime("%Y-%m-%d %H:%M:%S")
 
             flight = {
-                "origin": item["origin"],
-                "destination": item["destination"],
+                "origin": item_origin,
+                "destination": item_destination,
                 "depart_date": depart_date,
                 "departure_at": departure_at,
                 "price": price,
                 "airline": item.get("airline", "Unknown"),
                 "flight_number": str(item.get("flight_number", "")),
-                "transfers_count": int(item.get("transfers", item.get("number_of_changes", 0))),
+                "transfers_count": transfers_count,
                 "duration": int(item.get("duration", 0)),  # in minutes (Auditor connection timing improvement)
                 "fetched_at": fetched_at,
             }
+            booking_link = _absolute_aviasales_link(item.get("link"))
+            if booking_link:
+                flight["booking_link"] = booking_link
             parsed_flights.append(flight)
 
             # Save to local SQLite database cache (async-safe thread)
