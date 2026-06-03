@@ -121,8 +121,9 @@ class RouteDiscoveryService:
             candidate_edges.update(one_transfer_target_edges)
 
         # 4. Explore target-specific connections between first-layer hubs and target-side hubs.
-        # This is intentionally not "any discovered hub -> any discovered hub": that broad
-        # expansion made different countries produce suspiciously similar candidate graphs.
+        layer_1_to_2_edges = set()
+        second_layer_hubs = set()
+        
         if max_transfers >= 2:
             logger.info("Exploring first-layer hubs for target-side bridge connections...")
             for hub in first_hubs:
@@ -133,6 +134,10 @@ class RouteDiscoveryService:
                             connected_city = r["destination"]
                             if connected_city == hub:
                                 continue
+                                
+                            layer_1_to_2_edges.add((hub, connected_city))
+                            second_layer_hubs.add(connected_city)
+                            
                             if connected_city in backward_transit_hubs:
                                 bridge_edges.add((hub, connected_city))
                             elif connected_city in destination_set:
@@ -141,6 +146,67 @@ class RouteDiscoveryService:
             candidate_edges.update({(origin, hub) for hub in first_hubs_set})
             candidate_edges.update(target_side_edges)
             candidate_edges.update(bridge_edges)
+            candidate_edges.update(bridge_target_edges)
+            
+        deep_bridge_edges = set()
+        if max_transfers >= 3:
+            logger.info("Exploring second-layer hubs for deep bridge connections (max_transfers >= 3)...")
+            second_layer_hubs = clean_transit_hubs(second_layer_hubs)
+            second_hubs = sorted(second_layer_hubs, key=first_hub_rank)[:25]
+            
+            for hub in second_hubs:
+                for month in months:
+                    routes = await self.provider.get_outbound_directions(hub, month)
+                    for r in routes:
+                        if r["transfers"] == 0:
+                            connected_city = r["destination"]
+                            if connected_city == hub:
+                                continue
+                            if connected_city in backward_transit_hubs:
+                                deep_bridge_edges.add((hub, connected_city))
+                                # We MUST include the path to this second layer hub!
+                                candidate_edges.update({edge for edge in layer_1_to_2_edges if edge[1] == hub})
+                            elif connected_city in destination_set:
+                                bridge_target_edges.add((hub, connected_city))
+                                candidate_edges.update({edge for edge in layer_1_to_2_edges if edge[1] == hub})
+                                
+            candidate_edges.update(deep_bridge_edges)
+            candidate_edges.update(bridge_target_edges)
+            
+        layer_2_to_3_edges = set()
+        third_layer_hubs = set()
+        
+        if max_transfers >= 4:
+            logger.info("Exploring third-layer hubs for very deep bridge connections (max_transfers >= 4)...")
+            for h1, h2 in deep_bridge_edges:
+                third_layer_hubs.add(h2)
+            for h1, h2 in bridge_target_edges:
+                third_layer_hubs.add(h2) # wait, these are destinations. We want intermediate hubs.
+                
+            # A better way is just to expand the destinations from second layer
+            # Let's collect all connected_cities from the previous block
+            third_layer_candidates = set()
+            for hub, dest in deep_bridge_edges:
+                third_layer_candidates.add(dest)
+                
+            third_layer_candidates = clean_transit_hubs(third_layer_candidates)
+            third_hubs = sorted(third_layer_candidates, key=first_hub_rank)[:15]
+            
+            deep_deep_bridge_edges = set()
+            for hub in third_hubs:
+                for month in months:
+                    routes = await self.provider.get_outbound_directions(hub, month)
+                    for r in routes:
+                        if r["transfers"] == 0:
+                            connected_city = r["destination"]
+                            if connected_city == hub:
+                                continue
+                            if connected_city in backward_transit_hubs:
+                                deep_deep_bridge_edges.add((hub, connected_city))
+                            elif connected_city in destination_set:
+                                bridge_target_edges.add((hub, connected_city))
+                                
+            candidate_edges.update(deep_deep_bridge_edges)
             candidate_edges.update(bridge_target_edges)
                                 
         # Include manual ground legs

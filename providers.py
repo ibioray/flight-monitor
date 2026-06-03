@@ -436,3 +436,17 @@ class TravelpayoutsProvider(FlightProvider):
                 "transfers": int(item.get("transfers", 0))
             })
         return results
+
+class KiwiProvider(FlightProvider):
+    """Kiwi Tequila API Provider."""
+    
+    def __init__(self, token: str = ""):
+        self.token = token
+        self.base_url = "https://api.tequila.kiwi.com/v2/search"
+        self.rate_limiter = AsyncRateLimiter(target_rps=5.0, burst=3)
+        
+    async def get_prices(self, origin: str, destination: str, depart_month_or_date: str, direct_only: bool = False, cache_mode: str = "overview") -> list[dict]:
+        if not self.token:
+            return []
+        # TODO: Implement Kiwi /v2/search mapping to our format when API key is ready
+        return []

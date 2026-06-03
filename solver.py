@@ -125,7 +125,7 @@ class GraphSolver:
               baggage_needed: int = 0, stopovers_pref: list = None, exclusions: list = None,
               min_stopover_hours: int = 0, max_stopover_days: int = 5, stopover_preset: str = "balanced",
               allow_awkward_layovers: int = 1, visa_mode: str = "visa_free_only",
-              allowed_hubs: list = None):
+              allowed_hubs: list = None, nomad_mode: bool = False):
         """
         Builds a Directed Acyclic Graph (DAG) using priced segments passed directly in memory (Codex E)
         and finds valid, scored, and categorized routes with precise time-aware buffers.
@@ -155,6 +155,20 @@ class GraphSolver:
             min_stopover_hours = max(min_stopover_hours, 48)
             max_stopover_days = min(max_stopover_days, 5)
             allow_awkward_layovers = 0
+            nomad_mode = True  # Auto-activate nomad mode for mini_trip
+            
+        # Automatic nomad mode activation for 3+ transfers
+        if max_transfers >= 3:
+            nomad_mode = True
+
+        local_hour_cost_rub = HOUR_COST_RUB
+        local_edges_per_dest_date = EDGES_PER_DEST_DATE
+
+        if nomad_mode:
+            local_hour_cost_rub = 0
+            local_edges_per_dest_date = max(EDGES_PER_DEST_DATE, 7)
+            stopovers_pref = ["все"]
+            allowed_hubs = []
 
         # Load hubs from database metadata (static data)
         conn = get_db_connection()
@@ -214,7 +228,7 @@ class GraphSolver:
             collapsed = []
             for group in grouped.values():
                 group.sort(key=lambda x: x.get("price", float("inf")))
-                collapsed.extend(group[:EDGES_PER_DEST_DATE])
+                collapsed.extend(group[:local_edges_per_dest_date])
             adj_flights[orig] = collapsed
 
         # --- Route enumeration: k-shortest-paths via best-first search ---------------
@@ -308,7 +322,7 @@ class GraphSolver:
                 new_start = start_dt or seg_dep
                 new_price = price_sum + (segment.get("price", 0) or 0)
                 elapsed_h = max((seg_arr - new_start).total_seconds() / 3600.0, 0.0)
-                new_gcost = new_price + elapsed_h * HOUR_COST_RUB
+                new_gcost = new_price + elapsed_h * local_hour_cost_rub
                 heapq.heappush(
                     heap,
                     (new_gcost, next(counter), segment["destination"], path + [segment], new_price, new_start),
@@ -538,7 +552,7 @@ class GraphSolver:
             target_routes,
             key=lambda x: (
                 x["total_price"]
-                + x["duration_hours"] * HOUR_COST_RUB
+                + x["duration_hours"] * local_hour_cost_rub
                 + x["risk_score"] * RISK_COST_RUB,
                 len(x["segments"]),
             )
