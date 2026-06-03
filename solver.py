@@ -2,6 +2,8 @@ import sqlite3
 import json
 import logging
 import hashlib
+import heapq
+import itertools
 import math
 from datetime import datetime, timezone, timedelta
 from db import get_db_connection
@@ -215,111 +217,107 @@ class GraphSolver:
                 collapsed.extend(group[:EDGES_PER_DEST_DATE])
             adj_flights[orig] = collapsed
 
-        # Depth First Search to find all routes
+        # --- Route enumeration: k-shortest-paths via best-first search ---------------
+        # Replaces the previous exhaustive DFS. We expand partial paths in increasing
+        # order of generalized cost (ticket price + total elapsed travel time, including
+        # layover waits). Because complete routes are POPPED in cost order, the first
+        # MAX_TOTAL_ROUTES recorded are genuinely the K best — this is both complete
+        # (finds the true cheapest, unlike a capped DFS) and bounded (no blow-up).
+        max_legs = max_transfers + 1  # depth limit in segments (F)
+
+        def seg_duration_hours(seg):
+            """Flight/ground leg duration in hours, with a conservative default."""
+            if seg.get("is_manual"):
+                return float(seg.get("duration_hours", 0.0) or 0.0)
+            minutes = seg.get("duration", 0) or 0
+            hours = minutes / 60.0
+            return hours if hours > 0 else 5.0  # conservative default flight time
+
+        def can_extend(path, segment):
+            """All per-hop feasibility checks. Applied to EVERY hop, so multi-transfer
+            (2/3 connection) routes are validated at each intermediate hub."""
+            dest = segment["destination"]
+            current_airport = path[-1]["destination"] if path else origin_iata
+
+            # Blacklist on both endpoints.
+            if is_city_excluded(dest, exclusions, hubs) or is_city_excluded(current_airport, exclusions, hubs):
+                return False
+            # Whitelist: every INTERMEDIATE hub must be allowed (origin/dest exempt).
+            if dest not in destination_iatas and not is_hub_whitelisted(dest, allowed_hubs, hubs):
+                return False
+            # No cycles.
+            if any(x["origin"] == dest for x in path) or dest == origin_iata:
+                return False
+            # Visa: skip visa-required intermediate hubs in strict mode.
+            if dest not in destination_iatas:
+                hub_meta = hubs.get(dest)
+                if hub_meta and visa_allowed == 0 and hub_meta["requires_visa_for_ru"] == 1:
+                    return False
+            # Time-aware connection checks against the previous segment.
+            if path:
+                last_segment = path[-1]
+                last_dept = parse_departure_time(last_segment.get("departure_at", last_segment["depart_date"] + "T00:00:00Z"))
+                curr_dept = parse_departure_time(segment.get("departure_at", segment["depart_date"] + "T00:00:00Z"))
+                last_arrival = last_dept + timedelta(hours=seg_duration_hours(last_segment))
+                buffer_hours = (curr_dept - last_arrival).total_seconds() / 3600.0
+
+                min_buffer = 2.0  # carry-on standard transit
+                if last_segment["destination"] != segment["origin"]:
+                    min_buffer = 6.0  # airport change
+                elif baggage_needed == 1:
+                    min_buffer = 4.0  # checked baggage self-transfer
+
+                if buffer_hours < min_buffer:
+                    return False
+                if buffer_hours > max_stopover_days * 24.0:
+                    return False
+                if buffer_hours >= 48.0:
+                    if not is_stopover_allowed(last_segment["destination"], stopovers_pref, hubs):
+                        return False
+            return True
+
         all_routes = []
         route_cap_hit = [False]
-        expansions = [0]
+        counter = itertools.count()  # stable tie-breaker so heap never compares paths
+        pops = 0
 
-        def dfs(current_airport, current_date_str, path, depth):
-            # Hard caps to guarantee bounded work even on dense graphs (C1):
-            # cap both total node visits and total recorded routes.
-            expansions[0] += 1
-            if expansions[0] > MAX_DFS_EXPANSIONS or len(all_routes) >= MAX_TOTAL_ROUTES:
+        # Heap entry: (generalized_cost, tie, current_airport, path, price_sum, start_dt)
+        heap = [(0.0, next(counter), origin_iata, [], 0.0, None)]
+
+        while heap:
+            if len(all_routes) >= MAX_TOTAL_ROUTES or pops >= MAX_DFS_EXPANSIONS:
                 route_cap_hit[0] = True
-                return
+                break
 
-            # Base Case: arrived in target destination IATA
-            if current_airport in destination_iatas:
-                all_routes.append(list(path))
-                return
+            gcost, _, current_airport, path, price_sum, start_dt = heapq.heappop(heap)
+            pops += 1
 
-            # Limit segments to max_transfers + 1 (F: depth represents segment count)
-            if depth > max_transfers:
-                return
+            # Arrived at a target airport: record (in cost order) and stop expanding.
+            if path and current_airport in destination_iatas:
+                all_routes.append(path)
+                continue
 
-            outgoing = adj_flights.get(current_airport, [])
-            for segment in outgoing:
-                dest = segment["destination"]
-                dept_at_str = segment.get("departure_at", segment["depart_date"] + "T00:00:00Z")
+            if len(path) >= max_legs:
+                continue
 
-                # Filter out excluded transit hubs (blacklist). Checked per-hop on both
-                # endpoints, so it applies to EVERY intermediate hub of 1/2/3-transfer routes.
-                if is_city_excluded(dest, exclusions, hubs) or is_city_excluded(current_airport, exclusions, hubs):
+            for segment in adj_flights.get(current_airport, []):
+                if not can_extend(path, segment):
                     continue
+                seg_dep = parse_departure_time(segment.get("departure_at", segment["depart_date"] + "T00:00:00Z"))
+                seg_arr = seg_dep + timedelta(hours=seg_duration_hours(segment))
+                new_start = start_dt or seg_dep
+                new_price = price_sum + (segment.get("price", 0) or 0)
+                elapsed_h = max((seg_arr - new_start).total_seconds() / 3600.0, 0.0)
+                new_gcost = new_price + elapsed_h * HOUR_COST_RUB
+                heapq.heappush(
+                    heap,
+                    (new_gcost, next(counter), segment["destination"], path + [segment], new_price, new_start),
+                )
 
-                # Whitelist: when allowed_hubs is set, every INTERMEDIATE hub must be in it.
-                # `dest` is an intermediate hub only when it is not a final destination
-                # (origin is exempt as the start node). Applied per-hop, so a 2- or 3-transfer
-                # route is kept only if ALL of its hubs are whitelisted.
-                if dest not in destination_iatas and not is_hub_whitelisted(dest, allowed_hubs, hubs):
-                    continue
-
-                # Prevent cycles
-                if any(x["origin"] == dest for x in path) or dest == origin_iata:
-                    continue
-
-                # Visa validation for intermediate hubs
-                if dest not in destination_iatas:
-                    hub_meta = hubs.get(dest)
-                    if hub_meta:
-                        if visa_allowed == 0 and hub_meta["requires_visa_for_ru"] == 1:
-                            continue # skip visa required hub
-
-                # Date and timezone-aware connection checks (Codex C / Auditor refinements)
-                if path:
-                    last_segment = path[-1]
-                    last_dept = parse_departure_time(last_segment.get("departure_at", last_segment["depart_date"] + "T00:00:00Z"))
-                    curr_dept = parse_departure_time(dept_at_str)
-
-                    # Compute previous arrival time based on actual duration or conservative default (Codex C)
-                    if last_segment.get("is_manual"):
-                        last_duration_hours = last_segment.get("duration_hours", 0.0)
-                    else:
-                        last_duration_minutes = last_segment.get("duration", 0)
-                        last_duration_hours = last_duration_minutes / 60.0
-                        if last_duration_hours == 0:
-                            last_duration_hours = 5.0 # conservative default flight time
-
-                    last_arrival = last_dept + timedelta(hours=last_duration_hours)
-
-                    # Connection buffer in hours
-                    buffer_hours = (curr_dept - last_arrival).total_seconds() / 3600.0
-
-                    # Buffer check (Codex C)
-                    min_buffer = 2.0  # carry-on only standard transit
-
-                    airport_changed = last_segment["destination"] != segment["origin"]
-                    if airport_changed:
-                        min_buffer = 6.0  # airport transfer minimum
-                    elif baggage_needed == 1:
-                        min_buffer = 4.0  # checked baggage self-transfer minimum
-
-                    if buffer_hours < min_buffer:
-                        continue  # impossible or unsafe connection
-
-                    # Max layover constraint based on max_stopover_days (plan v3 §5)
-                    if buffer_hours > max_stopover_days * 24.0:
-                        continue
-
-                    # Stopover preference checks: if layover >= 48 hours, must be in stopovers_pref if specified (DOP-1)
-                    if buffer_hours >= 48.0:
-                        transit_city = last_segment["destination"]
-                        if not is_stopover_allowed(transit_city, stopovers_pref, hubs):
-                            continue
-
-                # Recurse
-                path.append(segment)
-                dfs(dest, dept_at_str, path, depth + 1)
-                path.pop()
-                if route_cap_hit[0]:
-                    break
-
-        # Start search from origin
-        dfs(origin_iata, date_start_str, [], 0)
         if route_cap_hit[0]:
             logger.warning(
-                "Route search hit safety cap (expansions=%s, routes=%s). Results may be partial.",
-                expansions[0], len(all_routes)
+                "Route search hit safety cap (pops=%s, routes=%s). Results may be partial.",
+                pops, len(all_routes),
             )
 
         # Score, filter, and structure results

@@ -632,6 +632,27 @@ async def run_test():
         for r in no_tas["ranked_routes"]
     ), "Blacklist must remove TAS from 1- and 2-transfer routes alike."
 
+    # 10c. k-shortest-paths: the true cheapest route must be found and ranked #1,
+    # even when it is a multi-leg cascade that is cheaper than an expensive direct.
+    logger.info("Testing k-shortest-paths picks the true global cheapest...")
+    ksp_flights = [
+        _f("UFA", "PEK", "2026-06-10", 50000),                 # pricey direct
+        _f("UFA", "TAS", "2026-06-10", 5000),                  # cheap leg 1
+        _f("TAS", "PEK", "2026-06-12", 8000),                  # cheap leg 2  -> total 13000
+    ]
+    ksp = solver.solve(
+        origin_iata="UFA", destination_country_code="CN", destination_iatas=["PEK"],
+        date_start_str="2026-06-10", date_end_str="2026-06-20", priced_flights=ksp_flights,
+        max_transfers=3, visa_allowed=1, max_budget=100000, visa_mode="ignore",
+        min_stopover_hours=0, max_stopover_days=6, allow_awkward_layovers=1,
+    )
+    assert ksp["cheapest"], "k-shortest search must find at least one route."
+    best = ksp["cheapest"][0]
+    assert abs(best["base_price"] - 13000) < 1e-6, (
+        f"Cheapest must be the 13000 cascade, not the 50000 direct (got {best['base_price']})."
+    )
+    assert len(best["segments"]) == 2, "True cheapest here is the 2-leg cascade."
+
     # 11. Price-drop monitoring decision test
     logger.info("Testing price-drop monitoring decisions...")
     alert_decision = price_drop_alert_decision(last_price=50000, current_price=45500, threshold_pct=8)
