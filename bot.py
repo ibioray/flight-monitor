@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 import json
@@ -123,7 +124,11 @@ STOPOVER_PRESETS = {
     },
     "balanced": {
         "label": "Баланс",
-        "min_stopover_hours": 18,
+        # min_stopover_hours is a HARD route filter in the solver (a route without a
+        # stopover >= this is dropped). For "balanced" we must NOT force a long stopover,
+        # otherwise fast routes with a normal 3-5h connection get deleted. 0 = allow both
+        # short connections AND multi-day stopovers (capped by max_stopover_days).
+        "min_stopover_hours": 0,
         "max_stopover_days": 3,
         "allow_awkward_layovers": 1,
     },
@@ -249,23 +254,124 @@ async def get_airports_for_country_with_llm(country_code: str) -> list[str]:
             logger.error(f"Failed to parse LLM airports response JSON: {e}. Raw response: {resp_text}")
     return []
 
-async def resolve_destination_airports(country_code: str) -> list[str]:
-    """Returns top airport IATA codes for a country using deterministic catalog first (Codex B)."""
-    code = country_code.upper()
-    if code in COUNTRY_AIRPORTS:
-        logger.info(f"Resolved airports for {code} deterministically: {COUNTRY_AIRPORTS[code]}")
-        return COUNTRY_AIRPORTS[code]
+async def resolve_destination_airports(destination_text: str) -> list[str]:
+    """Resolve a stored destination into target airport IATA codes.
 
-    # Allow explicit IATA airport/city codes if the user entered one instead of a country code.
-    if len(code) == 3 and code.isalpha():
-        logger.info(f"Treating {code} as an explicit airport/city IATA code.")
-        return [code]
+    destination_text may be:
+      - a comma-separated list of explicit airports, e.g. "PVG,SHA,PEK" (city-level target);
+      - a single country code in the catalog, e.g. "CN";
+      - a single explicit airport/city IATA, e.g. "PVG";
+      - any other country code (LLM fallback).
+    """
+    text = (destination_text or "").strip().upper()
 
-    # LLM fallback
-    logger.info(f"Resolving airports for {code} dynamically via LLM...")
-    resolved = await get_airports_for_country_with_llm(code)
-    logger.info(f"LLM resolved airports for {code}: {resolved}")
+    # City-level target: explicit comma-separated airport list (Город-цель).
+    if "," in text:
+        codes = [c.strip() for c in text.split(",") if len(c.strip()) == 3 and c.strip().isalpha()]
+        if codes:
+            logger.info(f"Resolved explicit airport target list: {codes}")
+            return codes
+
+    if text in COUNTRY_AIRPORTS:
+        logger.info(f"Resolved airports for {text} deterministically: {COUNTRY_AIRPORTS[text]}")
+        return COUNTRY_AIRPORTS[text]
+
+    # Single explicit IATA airport/city code.
+    if len(text) == 3 and text.isalpha():
+        logger.info(f"Treating {text} as an explicit airport/city IATA code.")
+        return [text]
+
+    # LLM fallback (treat as a country name/code).
+    logger.info(f"Resolving airports for {text} dynamically via LLM...")
+    resolved = await get_airports_for_country_with_llm(text)
+    logger.info(f"LLM resolved airports for {text}: {resolved}")
     return resolved
+
+
+# Deterministic catalog for the most common city-level targets, so city resolution does
+# not fully depend on the LLM. Keys are lowercase RU/EN aliases.
+CITY_AIRPORTS = {
+    "шанхай": ["PVG", "SHA"], "shanghai": ["PVG", "SHA"],
+    "пекин": ["PEK", "PKX"], "beijing": ["PEK", "PKX"],
+    "гуанчжоу": ["CAN"], "guangzhou": ["CAN"],
+    "шэньчжэнь": ["SZX"], "shenzhen": ["SZX"],
+    "чэнду": ["CTU", "TFU"], "chengdu": ["CTU", "TFU"],
+    "урумчи": ["URC"], "urumqi": ["URC"],
+    "сиань": ["XIY"], "xian": ["XIY"], "xi'an": ["XIY"],
+    "ханчжоу": ["HGH"], "hangzhou": ["HGH"],
+    "санья": ["SYX"], "sanya": ["SYX"],
+    "гонконг": ["HKG"], "hong kong": ["HKG"], "hongkong": ["HKG"],
+    "бангкок": ["BKK", "DMK"], "bangkok": ["BKK", "DMK"],
+    "пхукет": ["HKT"], "phuket": ["HKT"],
+    "ханой": ["HAN"], "hanoi": ["HAN"],
+    "хошимин": ["SGN"], "ho chi minh": ["SGN"], "сайгон": ["SGN"],
+    "стамбул": ["IST", "SAW"], "istanbul": ["IST", "SAW"],
+    "дубай": ["DXB"], "dubai": ["DXB"],
+    "сеул": ["ICN", "GMP"], "seoul": ["ICN", "GMP"],
+    "токио": ["HND", "NRT"], "tokyo": ["HND", "NRT"],
+}
+
+
+async def parse_destination_with_llm(text: str) -> dict:
+    """Resolve free-text destination into either a country or specific city airports.
+
+    Returns {"kind": "country"|"city", "iata_list": [...], "resolved_name": str}.
+    Deterministic city/country catalogs are tried before the LLM (Город-цель).
+    """
+    raw = (text or "").strip()
+    low = raw.lower()
+
+    # 1. Deterministic city aliases (single or several joined by или/and/comma).
+    matched_airports: list[str] = []
+    matched_names: list[str] = []
+    for token in re.split(r"\s+или\s+|\s+и\s+|\s+or\s+|\s+and\s+|[,/]", low):
+        key = token.strip()
+        if key in CITY_AIRPORTS:
+            for code in CITY_AIRPORTS[key]:
+                if code not in matched_airports:
+                    matched_airports.append(code)
+            matched_names.append(key)
+    if matched_airports:
+        return {"kind": "city", "iata_list": matched_airports, "resolved_name": raw}
+
+    # 2. Explicit IATA list typed by the user (e.g. "PVG, PEK").
+    explicit = [t.strip().upper() for t in re.split(r"[,/\s]+", raw) if len(t.strip()) == 3 and t.strip().isalpha()]
+    if explicit and len(explicit) == len([t for t in re.split(r"[,/\s]+", raw) if t.strip()]):
+        return {"kind": "city", "iata_list": explicit, "resolved_name": raw}
+
+    # 3. LLM structured resolution.
+    prompt = f"""
+Определи пункт назначения из текста: '{raw}'.
+Это либо СТРАНА (например, Китай, Таиланд), либо конкретный ГОРОД/города
+(например, Шанхай, Пекин, "Шанхай или Пекин").
+Верни СТРОГО JSON без пояснений:
+{{"kind": "country" или "city", "country_code": "ISO alpha-2 или пусто", "iata_list": ["IATA", ...], "resolved_name": "название на русском"}}
+Правила:
+- Страна: country_code = ISO код (CN, TH, VN...), iata_list = [].
+- Город/города: iata_list = 3-буквенные IATA всех крупных аэропортов названных городов
+  (Шанхай -> ["PVG","SHA"], Пекин -> ["PEK","PKX"]). Несколько городов — включи все.
+"""
+    resp_text = await call_llm(prompt)
+    if resp_text:
+        try:
+            cleaned = resp_text.strip().replace("```json", "").replace("```", "")
+            parsed = json.loads(cleaned)
+            kind = parsed.get("kind")
+            iata_list = [
+                str(c).upper().strip() for c in parsed.get("iata_list", [])
+                if isinstance(c, str) and len(c.strip()) == 3 and c.strip().isalpha()
+            ]
+            if kind == "city" and iata_list:
+                return {"kind": "city", "iata_list": iata_list, "resolved_name": parsed.get("resolved_name", raw)}
+            country = str(parsed.get("country_code", "")).upper().strip()
+            if country:
+                return {"kind": "country", "iata_list": [country], "resolved_name": parsed.get("resolved_name", raw)}
+        except Exception as e:
+            logger.error(f"Failed to parse destination JSON: {e}. Raw: {resp_text}")
+
+    # 4. Fallback: legacy country-code resolver.
+    legacy = await parse_location_with_llm(raw, is_country=True)
+    return {"kind": "country", "iata_list": [legacy["iata"]], "resolved_name": legacy.get("resolved_name", raw)}
 
 async def parse_dates_with_llm(text: str) -> dict:
     """Uses LLM to resolve flexible date strings to concrete YYYY-MM-DD ranges."""
@@ -662,20 +768,36 @@ async def process_origin(message: types.Message, state: FSMContext):
     await state.set_state(SearchWizard.waiting_for_destination)
     await message.answer(
         f"✅ Город отправления определен как: **{resolved.get('resolved_name', origin_text)} ({resolved['iata']})**\n\n"
-        f"🌏 **Шаг 2 из 11:** Куда летим?\nНапишите название страны назначения (например, Китай, Вьетнам, Таиланд) или код IATA:"
+        f"🌏 **Шаг 2 из 11:** Куда летим?\n"
+        f"Можно указать *страну* (например, Китай) — тогда проверю все крупные аэропорты,\n"
+        f"либо *конкретный город или несколько* (например, *Шанхай* или *Шанхай или Пекин*) — "
+        f"тогда ищу только в выбранные города:"
     )
 
 @router.message(SearchWizard.waiting_for_destination)
 async def process_destination(message: types.Message, state: FSMContext):
     dest_text = message.text.strip()
-    status_msg = await message.answer("🔍 Распознаю страну...")
-    resolved = await parse_location_with_llm(dest_text, is_country=True)
+    status_msg = await message.answer("🔍 Распознаю направление...")
+    resolved = await parse_destination_with_llm(dest_text)
     await status_msg.delete()
 
-    await state.update_data(dest_iata=resolved["iata"], dest_name=resolved.get("resolved_name", dest_text))
+    if resolved["kind"] == "city":
+        # City-level target: store explicit airport list, e.g. "PVG,SHA,PEK".
+        dest_store = ",".join(resolved["iata_list"])
+        kind_label = "Города"
+    else:
+        # Whole-country target: store the country code (legacy behaviour).
+        dest_store = resolved["iata_list"][0]
+        kind_label = "Страна"
+
+    await state.update_data(
+        dest_iata=dest_store,
+        dest_name=resolved.get("resolved_name", dest_text),
+        dest_kind=resolved["kind"],
+    )
     await state.set_state(SearchWizard.waiting_for_dates)
     await message.answer(
-        f"✅ Страна назначения определена как: **{resolved.get('resolved_name', dest_text)} ({resolved['iata']})**\n\n"
+        f"✅ {kind_label} назначения: **{resolved.get('resolved_name', dest_text)} ({dest_store})**\n\n"
         f"📅 **Шаг 3 из 11:** Когда летим?\nНапишите дату или диапазон человеческим языком (например, *середина июня*, *ближайшие 2 недели*, *с 15 по 30 июня 2026*):"
     )
 
@@ -879,19 +1001,37 @@ async def process_visa_mode(message: types.Message, state: FSMContext):
 
     await state.set_state(SearchWizard.waiting_for_exclusions)
     await message.answer(
-        "🛡️ *Шаг 11 из 11:* Исключения\n"
-        "Какие страны/города транзита нужно точно исключить (например: *Стамбул, Дубай*)?\n"
-        "Отправьте *Нет*, если ничего исключать не нужно:",
+        "🛡️ *Шаг 11 из 11:* Фильтр городов пересадок\n\n"
+        "Можно ограничить, через какие города строить пересадки. Это работает для любого "
+        "числа пересадок (1, 2 или 3) — фильтр применяется к каждому транзитному городу.\n\n"
+        "• *Исключить:* напишите города через запятую (например: *Стамбул, Дубай*)\n"
+        "• *Только эти:* начните со слова `только` (например: *только Ташкент, Алматы, Ереван*) — "
+        "тогда маршруты строятся пересадками лишь через эти города\n"
+        "• *Нет* — без ограничений",
         reply_markup=types.ReplyKeyboardRemove()
     )
 
 @router.message(SearchWizard.waiting_for_exclusions)
 async def process_exclusions(message: types.Message, state: FSMContext):
     text = message.text.strip()
-    exclusions = [] if text.lower() in ["нет", "не надо"] else [s.strip() for s in text.split(",")]
+    low = text.lower()
+
+    exclusions: list = []
+    allowed_hubs: list = []
+    if low in ["нет", "не надо", "-", "любые", "все", "всё"]:
+        pass
+    elif low.startswith("только") or low.startswith("whitelist") or low.startswith("вайтлист"):
+        # Whitelist mode: route transit only through these hubs (applies to every hop).
+        body = text.split(":", 1)[1] if ":" in text else re.sub(r"^(только|whitelist|вайтлист)\s*", "", text, flags=re.IGNORECASE)
+        allowed_hubs = [s.strip() for s in body.split(",") if s.strip()]
+    else:
+        # Blacklist mode (optionally prefixed with "кроме").
+        body = re.sub(r"^(кроме|исключить|except)\s*:?\s*", "", text, flags=re.IGNORECASE)
+        exclusions = [s.strip() for s in body.split(",") if s.strip()]
 
     # Finalize search wizard
     data = await state.get_data()
+    data["allowed_hubs"] = allowed_hubs
     await state.clear()
 
     # Save search preferences in DB (DOP-1 / async-safe thread)
@@ -908,6 +1048,7 @@ async def process_exclusions(message: types.Message, state: FSMContext):
         max_budget=data["max_budget"],
         stopovers=data["stopovers"],
         exclusions=exclusions,
+        allowed_hubs=allowed_hubs,
         baggage_needed=data["baggage_needed"],
         stopover_preset=data.get("stopover_preset", "balanced"),
         min_stopover_hours=data.get("min_stopover_hours", 0),
@@ -951,6 +1092,7 @@ async def process_exclusions(message: types.Message, state: FSMContext):
         "baggage_needed": data["baggage_needed"],
         "stopovers": data["stopovers"],
         "exclusions": exclusions,
+        "allowed_hubs": allowed_hubs,
         "stopover_preset": data.get("stopover_preset", "balanced"),
         "min_stopover_hours": data.get("min_stopover_hours", 0),
         "max_stopover_days": data.get("max_stopover_days", 5),
@@ -1139,6 +1281,7 @@ async def cmd_refresh_search(message: types.Message):
         "baggage_needed": search.get("baggage_needed", 0),
         "stopovers": json.loads(search.get("stopovers_json") or "[]"),
         "exclusions": json.loads(search.get("exclusions_json") or "[]"),
+        "allowed_hubs": json.loads(search.get("allowed_hubs_json") or "[]"),
         "stopover_preset": search.get("stopover_preset", "balanced"),
         "min_stopover_hours": search.get("min_stopover_hours", 0),
         "max_stopover_days": search.get("max_stopover_days", 5),
@@ -1696,6 +1839,7 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
     baggage_needed = search_config.get("baggage_needed", 0)
     stopovers_pref = search_config.get("stopovers", [])
     exclusions = search_config.get("exclusions", [])
+    allowed_hubs = search_config.get("allowed_hubs", [])
     search_id = search_config.get("search_id")
 
     cache_mode = search_config.get("cache_mode", "overview")
@@ -1846,6 +1990,29 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
 
         await asyncio.sleep(1.0) # Rate limit cooling
 
+    # Connecting-fare lookup (Стыковочные тарифы): besides self-assembled cascades of
+    # separate direct tickets, also fetch the real cheapest itineraries sold as a SINGLE
+    # ticket for origin -> each target airport (this is what Aviasales shows for "1 stop").
+    # These give the user a true bookable cheapest option alongside the cascades.
+    connect_tasks = [
+        provider.get_prices(origin, dest, m, direct_only=False, cache_mode=cache_mode)
+        for dest in destination_iatas
+        for m in months_list
+    ]
+    connecting_count = 0
+    for i in range(0, len(connect_tasks), chunk_size):
+        results = await asyncio.gather(*connect_tasks[i:i + chunk_size])
+        for res in results:
+            for f in (res or []):
+                # Keep only true single-ticket connecting itineraries (>=1 transfer);
+                # pure-direct ones are already covered by the direct pass above.
+                if f.get("transfers_count", 0) >= 1:
+                    f["is_connecting_fare"] = True
+                    priced_flights.append(f)
+                    connecting_count += 1
+        await asyncio.sleep(1.0)
+    logger.info(f"Connecting-fare lookup added {connecting_count} single-ticket itineraries.")
+
     # Update status message before running analyst
     if status_msg:
         try:
@@ -1878,6 +2045,7 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         baggage_needed=baggage_needed,
         stopovers_pref=stopovers_pref,
         exclusions=exclusions,
+        allowed_hubs=allowed_hubs,
         min_stopover_hours=min_stopover_hours,
         max_stopover_days=max_stopover_days,
         stopover_preset=stopover_preset,

@@ -71,6 +71,30 @@ def is_stopover_allowed(city_iata, stopovers_pref, hubs):
         return True
     return False
 
+def is_hub_whitelisted(city_iata, allowed_hubs, hubs):
+    """Whitelist for INTERMEDIATE transit hubs.
+
+    If allowed_hubs is empty -> no restriction (every hub allowed). Otherwise a transit
+    hub is allowed only if it matches one of allowed_hubs by IATA code, city name, or
+    country code. Matching mirrors is_city_excluded so include/exclude behave symmetrically.
+
+    NOTE: this is applied per-hop in the DFS, so it constrains EVERY intermediate hub of a
+    route regardless of how many transfers (1, 2 or 3) the route has.
+    """
+    if not allowed_hubs:
+        return True
+    cleaned = [x.strip().lower() for x in allowed_hubs if x and x.strip()]
+    if not cleaned or "все" in cleaned or "всё" in cleaned or "любые" in cleaned:
+        return True
+    if city_iata.lower() in cleaned:
+        return True
+    hub_info = hubs.get(city_iata)
+    if hub_info and hub_info["city_name"].lower() in cleaned:
+        return True
+    if hub_info and hub_info.get("country_code", "").lower() in cleaned:
+        return True
+    return False
+
 def route_signature(route: list[dict]) -> str:
     parts = []
     for segment in route:
@@ -98,7 +122,8 @@ class GraphSolver:
               visa_allowed: int = 1, lodging_exceptions: dict = None, max_budget: float = None,
               baggage_needed: int = 0, stopovers_pref: list = None, exclusions: list = None,
               min_stopover_hours: int = 0, max_stopover_days: int = 5, stopover_preset: str = "balanced",
-              allow_awkward_layovers: int = 1, visa_mode: str = "visa_free_only"):
+              allow_awkward_layovers: int = 1, visa_mode: str = "visa_free_only",
+              allowed_hubs: list = None):
         """
         Builds a Directed Acyclic Graph (DAG) using priced segments passed directly in memory (Codex E)
         and finds valid, scored, and categorized routes with precise time-aware buffers.
@@ -113,6 +138,7 @@ class GraphSolver:
         lodging_exceptions = lodging_exceptions or {}
         stopovers_pref = stopovers_pref or []
         exclusions = exclusions or []
+        allowed_hubs = allowed_hubs or []
 
         # Apply preset defaults if not overridden (plan v3 §5)
         if stopover_preset == "fast":
@@ -216,8 +242,16 @@ class GraphSolver:
                 dest = segment["destination"]
                 dept_at_str = segment.get("departure_at", segment["depart_date"] + "T00:00:00Z")
 
-                # Filter out excluded transit hubs (DOP-1)
+                # Filter out excluded transit hubs (blacklist). Checked per-hop on both
+                # endpoints, so it applies to EVERY intermediate hub of 1/2/3-transfer routes.
                 if is_city_excluded(dest, exclusions, hubs) or is_city_excluded(current_airport, exclusions, hubs):
+                    continue
+
+                # Whitelist: when allowed_hubs is set, every INTERMEDIATE hub must be in it.
+                # `dest` is an intermediate hub only when it is not a final destination
+                # (origin is exempt as the start node). Applied per-hop, so a 2- or 3-transfer
+                # route is kept only if ALL of its hubs are whitelisted.
+                if dest not in destination_iatas and not is_hub_whitelisted(dest, allowed_hubs, hubs):
                     continue
 
                 # Prevent cycles
@@ -488,7 +522,12 @@ class GraphSolver:
                 stopover_routes.append(r)
         stopover_routes = sorted(stopover_routes, key=lambda x: x["total_price"])[:5]
 
-        direct_routes = [r for r in target_routes if len(r["segments"]) == 1]
+        # Truly direct = single segment with no transfers. A single-ticket connecting fare
+        # is also one segment but represents >=1 stop, so it must not get the "Прямой" badge.
+        direct_routes = [
+            r for r in target_routes
+            if len(r["segments"]) == 1 and not r["segments"][0].get("transfers_count")
+        ]
         direct_routes = sorted(direct_routes, key=lambda x: (x["total_price"], x["duration_hours"]))[:5]
 
         one_connection_routes = [r for r in target_routes if len(r["segments"]) == 2]

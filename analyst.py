@@ -136,8 +136,13 @@ class TelegramReportRenderer:
         age = ""
         if leg.get("fetched_at"):
             age = f", {format_price_age(leg.get('fetched_at'))}"
+        # Single-ticket connecting fare (Стыковочные тарифы): one booking, but with stops.
+        fare_note = ""
+        transfers = int(leg.get("transfers_count", 0) or 0)
+        if transfers >= 1:
+            fare_note = f", 1 билет, пересадок: {transfers}"
         link = leg.get("booking_link") or make_aviasales_link(origin_code, destination_code, date)
-        return f"{origin} -> {destination} ({date}, [{price} ₽]({link}), {transport}{age})"
+        return f"{origin} -> {destination} ({date}, [{price} ₽]({link}), {transport}{fare_note}{age})"
 
     def render_stopover(self, stop: dict) -> str:
         city_code = self.clean_text(stop.get("city", ""))

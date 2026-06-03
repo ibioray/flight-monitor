@@ -162,6 +162,7 @@ def init_db():
         price_drop_threshold_pct REAL DEFAULT 10,
         stopovers_json TEXT DEFAULT '[]',
         exclusions_json TEXT DEFAULT '[]',
+        allowed_hubs_json TEXT DEFAULT '[]',
         baggage_needed INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(user_id) REFERENCES users(user_id)
@@ -171,6 +172,7 @@ def init_db():
     # 2.1 Migrate user_searches column-by-column. This survives partially migrated DBs.
     _add_column_if_missing(cursor, "user_searches", "stopovers_json", "stopovers_json TEXT DEFAULT '[]'")
     _add_column_if_missing(cursor, "user_searches", "exclusions_json", "exclusions_json TEXT DEFAULT '[]'")
+    _add_column_if_missing(cursor, "user_searches", "allowed_hubs_json", "allowed_hubs_json TEXT DEFAULT '[]'")
     _add_column_if_missing(cursor, "user_searches", "baggage_needed", "baggage_needed INTEGER DEFAULT 0")
     _add_column_if_missing(cursor, "user_searches", "last_checked_at", "last_checked_at TEXT")
     _add_column_if_missing(cursor, "user_searches", "price_drop_threshold_pct", "price_drop_threshold_pct REAL DEFAULT 10")
@@ -429,23 +431,23 @@ def save_user_search(user_id: int, origin_iata: str, destination_text: str, date
                      cache_mode: str = "overview", min_stopover_hours: int = 0,
                      max_stopover_days: int = 5, stopover_preset: str = "balanced",
                      allow_awkward_layovers: int = 1, visa_mode: str = "visa_free_only",
-                     price_drop_threshold_pct: float = 10.0):
+                     price_drop_threshold_pct: float = 10.0, allowed_hubs: list = None):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
     INSERT INTO user_searches (
-        user_id, origin_iata, destination_text, date_start, date_end, 
+        user_id, origin_iata, destination_text, date_start, date_end,
         max_transfers, visa_allowed, lodging_exceptions_json, max_budget,
-        stopovers_json, exclusions_json, baggage_needed,
+        stopovers_json, exclusions_json, allowed_hubs_json, baggage_needed,
         price_drop_threshold_pct,
         cache_mode, min_stopover_hours, max_stopover_days, stopover_preset,
         allow_awkward_layovers, visa_mode
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        user_id, origin_iata, destination_text, date_start, date_end, 
+        user_id, origin_iata, destination_text, date_start, date_end,
         max_transfers, visa_allowed, json.dumps(lodging_exceptions), max_budget,
-        json.dumps(stopovers or []), json.dumps(exclusions or []), baggage_needed,
+        json.dumps(stopovers or []), json.dumps(exclusions or []), json.dumps(allowed_hubs or []), baggage_needed,
         price_drop_threshold_pct,
         cache_mode, min_stopover_hours, max_stopover_days, stopover_preset,
         allow_awkward_layovers, visa_mode

@@ -567,6 +567,71 @@ async def run_test():
         for route in excluded_country_results["ranked_routes"]
     ), "Country-code exclusions should remove transit hubs in that country."
 
+    # 10b. Hub include/exclude across MULTI-transfer (2-transfer / 3-leg) routes.
+    # Critical: the filter must apply to EVERY intermediate hub, not just the first.
+    logger.info("Testing hub whitelist/blacklist on 1- and 2-transfer routes...")
+
+    def _f(o, d, date, price, dur=300):
+        return {
+            "origin": o, "destination": d,
+            "depart_date": date, "departure_at": f"{date}T08:00:00Z",
+            "price": float(price), "airline": "XX", "flight_number": f"{o}{d}",
+            "transfers_count": 0, "duration": dur,
+        }
+
+    # Graph to PEK:
+    #   UFA->ALA->PEK            (1 transfer, hub ALA)
+    #   UFA->TAS->PEK            (1 transfer, hub TAS)
+    #   UFA->IST->TAS->PEK       (2 transfers, hubs IST + TAS)
+    hub_flights = [
+        _f("UFA", "ALA", "2026-06-10", 9000), _f("ALA", "PEK", "2026-06-11", 12000),
+        _f("UFA", "TAS", "2026-06-10", 8000), _f("TAS", "PEK", "2026-06-12", 13000),
+        _f("UFA", "IST", "2026-06-10", 7000), _f("IST", "TAS", "2026-06-11", 6000),
+    ]
+    hub_common = dict(
+        origin_iata="UFA", destination_country_code="CN", destination_iatas=["PEK"],
+        date_start_str="2026-06-10", date_end_str="2026-06-20", priced_flights=hub_flights,
+        max_transfers=3, visa_allowed=1, max_budget=100000, visa_mode="ignore",
+        min_stopover_hours=0, max_stopover_days=6, allow_awkward_layovers=1,
+    )
+
+    def _hubs_used(result):
+        used = set()
+        for route in result["ranked_routes"]:
+            for leg in route["segments"]:
+                used.add(leg["origin"]); used.add(leg["destination"])
+        return used
+
+    # Baseline: all three routes discoverable.
+    base = solver.solve(**hub_common)
+    assert any(len(r["segments"]) == 3 for r in base["ranked_routes"]), "2-transfer route must be found at baseline."
+
+    # Whitelist a single hub that only appears on the 1-transfer route -> 2-transfer route gone.
+    only_ala = solver.solve(**hub_common, allowed_hubs=["ALA"])
+    used = _hubs_used(only_ala)
+    assert "ALA" in used, "Whitelisted hub ALA must remain."
+    assert "TAS" not in used and "IST" not in used, "Whitelist must drop all non-whitelisted hubs (incl. on 2-transfer routes)."
+
+    # Whitelist TAS only: 1-transfer UFA->TAS->PEK ok, but 2-transfer UFA->IST->TAS->PEK
+    # must be dropped because IST (an intermediate hub) is not whitelisted.
+    only_tas = solver.solve(**hub_common, allowed_hubs=["TAS"])
+    assert not any(
+        any(leg["origin"] == "IST" or leg["destination"] == "IST" for leg in r["segments"])
+        for r in only_tas["ranked_routes"]
+    ), "Whitelist must reject a 2-transfer route if ANY intermediate hub is not whitelisted."
+    assert any(len(r["segments"]) == 2 for r in only_tas["ranked_routes"]), "1-transfer route via TAS must survive."
+
+    # Whitelist BOTH hubs of the 2-transfer route -> it must survive.
+    ist_tas = solver.solve(**hub_common, allowed_hubs=["IST", "TAS"])
+    assert any(len(r["segments"]) == 3 for r in ist_tas["ranked_routes"]), "2-transfer route must survive when all its hubs are whitelisted."
+
+    # Blacklist TAS: every route through TAS (1- and 2-transfer) must be gone.
+    no_tas = solver.solve(**hub_common, exclusions=["TAS"])
+    assert not any(
+        any(leg["origin"] == "TAS" or leg["destination"] == "TAS" for leg in r["segments"])
+        for r in no_tas["ranked_routes"]
+    ), "Blacklist must remove TAS from 1- and 2-transfer routes alike."
+
     # 11. Price-drop monitoring decision test
     logger.info("Testing price-drop monitoring decisions...")
     alert_decision = price_drop_alert_decision(last_price=50000, current_price=45500, threshold_pct=8)
