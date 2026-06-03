@@ -167,8 +167,11 @@ class GraphSolver:
         if nomad_mode:
             local_hour_cost_rub = 0
             local_edges_per_dest_date = max(EDGES_PER_DEST_DATE, 7)
-            stopovers_pref = ["все"]
-            allowed_hubs = []
+            # Only relax stopover/hub restrictions if user didn't set them explicitly
+            if not stopovers_pref:
+                stopovers_pref = ["все"]
+            if not allowed_hubs:
+                allowed_hubs = []
 
         # Load hubs from database metadata (static data)
         conn = get_db_connection()
