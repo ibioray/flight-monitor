@@ -746,6 +746,17 @@ async def run_test():
     assert bot_module._valid_country_code("CN") == "CN", "ASCII country code should remain valid."
     assert bot_module._valid_country_code("СN") is None, "Mixed Cyrillic/Latin country code must not pass."
 
+    async def ufa_autocomplete(*args, **kwargs):
+        return [{"type": "city", "code": "UFA", "name": "Уфа"}]
+
+    async def airports_for_city_must_not_run(*args, **kwargs):
+        raise AssertionError("Origin parsing must not load the full airport catalog.")
+
+    bot_module.travelpayouts_autocomplete_places = ufa_autocomplete
+    bot_module.airports_for_city = airports_for_city_must_not_run
+    parsed_origin = await bot_module.parse_location_with_llm("Уфа", is_country=False)
+    assert parsed_origin["iata"] == "UFA", f"Уфа must normalize to UFA, got {parsed_origin!r}."
+
     async def no_autocomplete(*args, **kwargs):
         return None
 
@@ -754,8 +765,8 @@ async def run_test():
 
     bot_module.resolve_place_with_autocomplete = no_autocomplete
     bot_module.call_llm = no_llm
-    parsed_origin = await bot_module.parse_location_with_llm("УФА", is_country=False)
-    assert parsed_origin["iata"] == "UFA", f"УФА must normalize to UFA, got {parsed_origin!r}."
+    parsed_origin_fallback = await bot_module.parse_location_with_llm("УФА", is_country=False)
+    assert parsed_origin_fallback["iata"] == "UFA", f"УФА must normalize to UFA, got {parsed_origin_fallback!r}."
 
     # Clean up test DB after run
     if os.path.exists(TEST_DB_PATH):

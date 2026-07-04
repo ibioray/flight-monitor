@@ -6,7 +6,7 @@ from pathlib import Path
 
 import httpx
 
-from airport_names import remember_iata_name
+from airport_names import remember_iata_name, remember_iata_names
 
 logger = logging.getLogger("airport_catalog")
 
@@ -135,14 +135,16 @@ def _load_cache_any_age() -> dict | None:
 
 
 def _remember_known_names(airports: list[dict], cities: list[dict]):
+    entries = []
     for city in cities:
         code = _valid_iata(city.get("code"))
         if code:
-            remember_iata_name(code, _name_for_item(city))
+            entries.append((code, _name_for_item(city)))
     for airport in airports:
         code = _valid_iata(airport.get("code"))
         if code:
-            remember_iata_name(code, _name_for_item(airport))
+            entries.append((code, _name_for_item(airport)))
+    remember_iata_names(entries)
 
 
 def _route_degree(routes: list[dict]) -> dict[str, int]:

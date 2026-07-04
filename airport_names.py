@@ -180,7 +180,7 @@ def _load_dynamic_names() -> dict[str, str]:
 def remember_iata_name(code: str, name: str | None):
     normalized = str(code or "").upper().strip()
     clean_name = str(name or "").strip()
-    if len(normalized) != 3 or not normalized.isalpha() or not clean_name:
+    if len(normalized) != 3 or not normalized.isascii() or not normalized.isalpha() or not clean_name:
         return
     if IATA_CITY_NAMES_RU.get(normalized) == clean_name:
         return
@@ -188,6 +188,31 @@ def remember_iata_name(code: str, name: str | None):
     if dynamic.get(normalized) == clean_name:
         return
     dynamic[normalized] = clean_name
+    try:
+        AIRPORT_NAMES_CACHE_PATH.write_text(
+            json.dumps(dynamic, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def remember_iata_names(entries):
+    dynamic = _load_dynamic_names()
+    changed = False
+    for code, name in entries or []:
+        normalized = str(code or "").upper().strip()
+        clean_name = str(name or "").strip()
+        if len(normalized) != 3 or not normalized.isascii() or not normalized.isalpha() or not clean_name:
+            continue
+        if IATA_CITY_NAMES_RU.get(normalized) == clean_name:
+            continue
+        if dynamic.get(normalized) == clean_name:
+            continue
+        dynamic[normalized] = clean_name
+        changed = True
+    if not changed:
+        return
     try:
         AIRPORT_NAMES_CACHE_PATH.write_text(
             json.dumps(dynamic, ensure_ascii=False, indent=2, sort_keys=True),

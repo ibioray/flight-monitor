@@ -263,7 +263,7 @@ async def travelpayouts_autocomplete_places(text: str, types: list[str] | None =
         logger.warning("Travelpayouts autocomplete failed for %s: %s", term, e)
         return []
 
-async def resolve_place_with_autocomplete(text: str, is_country: bool = False) -> dict | None:
+async def resolve_place_with_autocomplete(text: str, is_country: bool = False, expand_city: bool = False) -> dict | None:
     types = ["country"] if is_country else ["city", "airport"]
     places = await travelpayouts_autocomplete_places(text, types=types)
     for place in places:
@@ -276,7 +276,7 @@ async def resolve_place_with_autocomplete(text: str, is_country: bool = False) -
         if code:
             name = _place_name_ru(place) or text
             remember_iata_name(code, name)
-            airports = await airports_for_city(code)
+            airports = await airports_for_city(code) if expand_city else []
             return {"iata": (airports[0] if airports else code), "resolved_name": name}
     return None
 
@@ -304,7 +304,7 @@ async def parse_location_with_llm(text: str, is_country: bool = False) -> dict:
     if not is_country and explicit_iata:
         return {"iata": explicit_iata, "resolved_name": format_iata_city(explicit_iata)}
 
-    autocomplete = await resolve_place_with_autocomplete(text, is_country=is_country)
+    autocomplete = await resolve_place_with_autocomplete(text, is_country=is_country, expand_city=False)
     if autocomplete:
         return autocomplete
 
@@ -2183,6 +2183,21 @@ async def cmd_routes_by_comfort(message: types.Message):
 @router.message(Command("routes_by_stopover"))
 async def cmd_routes_by_stopover(message: types.Message):
     await _send_sorted_routes(message, "stopover")
+
+@router.message(lambda message: bool(message.text))
+async def cmd_unknown_text(message: types.Message, state: FSMContext):
+    await register_message_user(message)
+    current_state = await state.get_state()
+    if current_state:
+        await message.answer(
+            "Я получил текст, но не смог сопоставить его с текущим шагом. "
+            "Можно продолжить по подсказке выше или сбросить сценарий командой /cancel."
+        )
+        return
+    await message.answer(
+        "Похоже, сценарий поиска сейчас не активен или был сброшен после обновления бота.\n\n"
+        "Начните новый поиск командой /new_search."
+    )
 
 @router.callback_query(lambda callback: callback.data and callback.data.startswith("admin_approve:"))
 async def cb_admin_approve(callback: types.CallbackQuery):
