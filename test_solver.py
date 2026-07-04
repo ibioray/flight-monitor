@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 # Force isolated database for tests (Codex I)
 TEST_DB_PATH = os.path.join(tempfile.gettempdir(), "test_flight_monitor.db")
 os.environ["DATABASE_PATH"] = TEST_DB_PATH
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:ABCDEF")
 
 # Now import the modules which use config.DATABASE_PATH
 import config
@@ -736,6 +737,25 @@ async def run_test():
     first_baseline_decision = price_drop_alert_decision(last_price=0, current_price=50000, threshold_pct=8)
     assert not first_baseline_decision["should_alert"], "First observed price should create baseline silently."
     assert first_baseline_decision["should_update_baseline"], "First valid price should be stored as baseline."
+
+    # 12. Cyrillic city names must never be accepted as literal IATA codes.
+    logger.info("Testing IATA ASCII normalization for origin parsing...")
+    import bot as bot_module
+    assert bot_module._valid_iata("UFA") == "UFA", "ASCII IATA code should remain valid."
+    assert bot_module._valid_iata("УФА") is None, "Cyrillic lookalike must not be treated as IATA."
+    assert bot_module._valid_country_code("CN") == "CN", "ASCII country code should remain valid."
+    assert bot_module._valid_country_code("СN") is None, "Mixed Cyrillic/Latin country code must not pass."
+
+    async def no_autocomplete(*args, **kwargs):
+        return None
+
+    async def no_llm(*args, **kwargs):
+        return ""
+
+    bot_module.resolve_place_with_autocomplete = no_autocomplete
+    bot_module.call_llm = no_llm
+    parsed_origin = await bot_module.parse_location_with_llm("УФА", is_country=False)
+    assert parsed_origin["iata"] == "UFA", f"УФА must normalize to UFA, got {parsed_origin!r}."
 
     # Clean up test DB after run
     if os.path.exists(TEST_DB_PATH):

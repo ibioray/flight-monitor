@@ -221,7 +221,13 @@ async def call_llm(prompt: str) -> str:
 
 def _valid_iata(value: str | None) -> str | None:
     code = str(value or "").upper().strip()
-    if len(code) == 3 and code.isalpha():
+    if len(code) == 3 and code.isascii() and code.isalpha():
+        return code
+    return None
+
+def _valid_country_code(value: str | None) -> str | None:
+    code = str(value or "").upper().strip()
+    if len(code) == 2 and code.isascii() and code.isalpha():
         return code
     return None
 
@@ -262,8 +268,8 @@ async def resolve_place_with_autocomplete(text: str, is_country: bool = False) -
     places = await travelpayouts_autocomplete_places(text, types=types)
     for place in places:
         if is_country:
-            country_code = str(place.get("code") or place.get("country_code") or "").upper().strip()
-            if len(country_code) == 2 and country_code.isalpha():
+            country_code = _valid_country_code(place.get("code") or place.get("country_code"))
+            if country_code:
                 return {"iata": country_code, "resolved_name": _place_name_ru(place) or text}
             continue
         code = _valid_iata(place.get("code") or place.get("city_code"))
@@ -291,10 +297,12 @@ async def hydrate_iata_names(codes) -> None:
 async def parse_location_with_llm(text: str, is_country: bool = False) -> dict:
     """Uses LLM to resolve text names to airport/city/country IATA codes."""
     explicit = str(text or "").upper().strip()
-    if is_country and len(explicit) == 2 and explicit.isalpha():
-        return {"iata": explicit, "resolved_name": text}
-    if not is_country and _valid_iata(explicit):
-        return {"iata": explicit, "resolved_name": format_iata_city(explicit)}
+    country_code = _valid_country_code(explicit)
+    if is_country and country_code:
+        return {"iata": country_code, "resolved_name": text}
+    explicit_iata = _valid_iata(explicit)
+    if not is_country and explicit_iata:
+        return {"iata": explicit_iata, "resolved_name": format_iata_city(explicit_iata)}
 
     autocomplete = await resolve_place_with_autocomplete(text, is_country=is_country)
     if autocomplete:
@@ -311,8 +319,8 @@ async def parse_location_with_llm(text: str, is_country: bool = False) -> dict:
         try:
             cleaned = resp_text.strip().replace("```json", "").replace("```", "")
             parsed = json.loads(cleaned)
-            code = str(parsed.get("iata", "")).upper().strip()
-            if (is_country and len(code) == 2 and code.isalpha()) or (not is_country and _valid_iata(code)):
+            code = _valid_country_code(parsed.get("iata")) if is_country else _valid_iata(parsed.get("iata"))
+            if code:
                 if not is_country:
                     remember_iata_name(code, parsed.get("resolved_name"))
                 return {"iata": code, "resolved_name": parsed.get("resolved_name", text)}
@@ -370,7 +378,7 @@ async def resolve_destination_airports(destination_text: str) -> list[str]:
                         expanded.append(airport_code)
             return expanded
 
-    if len(text) == 2 and text.isalpha():
+    if _valid_country_code(text):
         dynamic_country_airports = await airports_for_country(text)
         if dynamic_country_airports:
             logger.info("Resolved airports for %s dynamically: %s", text, dynamic_country_airports)
@@ -380,7 +388,7 @@ async def resolve_destination_airports(destination_text: str) -> list[str]:
             return COUNTRY_AIRPORTS[text]
 
     # Single explicit IATA airport/city code.
-    if len(text) == 3 and text.isalpha():
+    if _valid_iata(text):
         city_airports = await airports_for_city(text)
         if city_airports:
             logger.info("Resolved city/airport %s dynamically: %s", text, city_airports)
@@ -442,7 +450,10 @@ async def parse_destination_with_llm(text: str) -> dict:
         return {"kind": "city", "iata_list": matched_airports, "resolved_name": raw}
 
     # 2. Explicit IATA list typed by the user (e.g. "PVG, PEK").
-    explicit = [t.strip().upper() for t in re.split(r"[,/\s]+", raw) if len(t.strip()) == 3 and t.strip().isalpha()]
+    explicit = [
+        code for code in (_valid_iata(t) for t in re.split(r"[,/\s]+", raw))
+        if code
+    ]
     if explicit and len(explicit) == len([t for t in re.split(r"[,/\s]+", raw) if t.strip()]):
         for code in explicit:
             remember_iata_name(code, format_iata_city(code))
@@ -454,8 +465,8 @@ async def parse_destination_with_llm(text: str) -> dict:
         place_type = str(place.get("type") or "").lower()
         name = _place_name_ru(place) or raw
         if place_type == "country":
-            country = str(place.get("code") or place.get("country_code") or "").upper().strip()
-            if len(country) == 2 and country.isalpha():
+            country = _valid_country_code(place.get("code") or place.get("country_code"))
+            if country:
                 return {"kind": "country", "iata_list": [country], "resolved_name": name}
         code = _valid_iata(place.get("code") or place.get("city_code"))
         if code:
@@ -481,15 +492,12 @@ async def parse_destination_with_llm(text: str) -> dict:
             cleaned = resp_text.strip().replace("```json", "").replace("```", "")
             parsed = json.loads(cleaned)
             kind = parsed.get("kind")
-            iata_list = [
-                str(c).upper().strip() for c in parsed.get("iata_list", [])
-                if isinstance(c, str) and len(c.strip()) == 3 and c.strip().isalpha()
-            ]
+            iata_list = [code for code in (_valid_iata(c) for c in parsed.get("iata_list", [])) if code]
             if kind == "city" and iata_list:
                 for code in iata_list:
                     remember_iata_name(code, parsed.get("resolved_name"))
                 return {"kind": "city", "iata_list": iata_list, "resolved_name": parsed.get("resolved_name", raw)}
-            country = str(parsed.get("country_code", "")).upper().strip()
+            country = _valid_country_code(parsed.get("country_code"))
             if country:
                 return {"kind": "country", "iata_list": [country], "resolved_name": parsed.get("resolved_name", raw)}
         except Exception as e:
