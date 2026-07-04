@@ -30,6 +30,7 @@ from discovery import RouteDiscoveryService
 from monitoring import price_drop_alert_decision
 from providers import _absolute_aviasales_link, _parse_changes_count
 from airport_names import format_iata_city
+import airport_catalog
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("test_solver")
@@ -272,6 +273,30 @@ async def run_test():
     overview = get_admin_overview()
     assert overview["users_total"] >= 1
     assert overview["runs_today"] >= 1
+
+    # 4c. Dynamic airport catalog should rank country/city airports without hardcoded lists.
+    airport_catalog._CATALOG = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "cities": [
+            {"code": "TYO", "country_code": "JP", "name": "Токио", "has_flightable_airport": True},
+            {"code": "ANK", "country_code": "TR", "name": "Анкара", "has_flightable_airport": True},
+        ],
+        "airports": [
+            {"code": "NRT", "city_code": "TYO", "country_code": "JP", "iata_type": "airport", "name": "Нарита", "flightable": True},
+            {"code": "HND", "city_code": "TYO", "country_code": "JP", "iata_type": "airport", "name": "Ханэда", "flightable": True},
+            {"code": "ESB", "city_code": "ANK", "country_code": "TR", "iata_type": "airport", "name": "Эсенбога", "flightable": True},
+            {"code": "XXX", "city_code": "ANK", "country_code": "TR", "iata_type": "airport", "name": "Closed", "flightable": False},
+        ],
+        "routes": [
+            {"departure_airport_iata": "HND", "arrival_airport_iata": "KIX"},
+            {"departure_airport_iata": "HND", "arrival_airport_iata": "CTS"},
+            {"departure_airport_iata": "NRT", "arrival_airport_iata": "LAX"},
+            {"departure_airport_iata": "ESB", "arrival_airport_iata": "IST"},
+        ],
+    }
+    assert await airport_catalog.airports_for_country("JP", limit=2) == ["HND", "NRT"]
+    assert await airport_catalog.airports_for_city("ANK", limit=4) == ["ANK", "ESB"]
+    airport_catalog._CATALOG = None
 
     # 5. Low Budget Fallback Test
     logger.info("Testing solver fallback for low budget (5,000 RUB)...")

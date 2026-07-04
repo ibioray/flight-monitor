@@ -37,6 +37,7 @@ from solver import GraphSolver
 from analyst import LLMCognitiveAnalyst
 from discovery import RouteDiscoveryService
 from airport_names import annotate_iata_codes, format_iata_city, remember_iata_name
+from airport_catalog import airports_for_city, airports_for_country
 from monitoring import (
     DEFAULT_PRICE_DROP_THRESHOLD_PCT,
     PRICE_DROP_THRESHOLD_OPTIONS,
@@ -269,7 +270,8 @@ async def resolve_place_with_autocomplete(text: str, is_country: bool = False) -
         if code:
             name = _place_name_ru(place) or text
             remember_iata_name(code, name)
-            return {"iata": code, "resolved_name": name}
+            airports = await airports_for_city(code)
+            return {"iata": (airports[0] if airports else code), "resolved_name": name}
     return None
 
 async def hydrate_iata_names(codes) -> None:
@@ -360,15 +362,30 @@ async def resolve_destination_airports(destination_text: str) -> list[str]:
         codes = [c.strip() for c in text.split(",") if len(c.strip()) == 3 and c.strip().isalpha()]
         if codes:
             logger.info(f"Resolved explicit airport target list: {codes}")
-            return codes
+            expanded = []
+            for code in codes:
+                city_airports = await airports_for_city(code)
+                for airport_code in (city_airports or [code]):
+                    if airport_code not in expanded:
+                        expanded.append(airport_code)
+            return expanded
 
-    if text in COUNTRY_AIRPORTS:
-        logger.info(f"Resolved airports for {text} deterministically: {COUNTRY_AIRPORTS[text]}")
-        return COUNTRY_AIRPORTS[text]
+    if len(text) == 2 and text.isalpha():
+        dynamic_country_airports = await airports_for_country(text)
+        if dynamic_country_airports:
+            logger.info("Resolved airports for %s dynamically: %s", text, dynamic_country_airports)
+            return dynamic_country_airports
+        if text in COUNTRY_AIRPORTS:
+            logger.warning("Using static country airport fallback for %s: %s", text, COUNTRY_AIRPORTS[text])
+            return COUNTRY_AIRPORTS[text]
 
     # Single explicit IATA airport/city code.
     if len(text) == 3 and text.isalpha():
-        logger.info(f"Treating {text} as an explicit airport/city IATA code.")
+        city_airports = await airports_for_city(text)
+        if city_airports:
+            logger.info("Resolved city/airport %s dynamically: %s", text, city_airports)
+            return city_airports
+        logger.info("Treating %s as an explicit airport/city IATA code.", text)
         return [text]
 
     # LLM fallback (treat as a country name/code).
@@ -443,7 +460,8 @@ async def parse_destination_with_llm(text: str) -> dict:
         code = _valid_iata(place.get("code") or place.get("city_code"))
         if code:
             remember_iata_name(code, name)
-            return {"kind": "city", "iata_list": [code], "resolved_name": name}
+            airports = await airports_for_city(code)
+            return {"kind": "city", "iata_list": airports or [code], "resolved_name": name}
 
     # 4. LLM structured resolution.
     prompt = f"""
