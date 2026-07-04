@@ -3,7 +3,7 @@ import json
 import logging
 import hashlib
 from datetime import datetime, timezone, timedelta
-from config import DATABASE_PATH
+from config import DATABASE_PATH, DEFAULT_DAILY_SEARCH_LIMIT
 
 logger = logging.getLogger("db")
 
@@ -139,9 +139,17 @@ def init_db():
         user_id INTEGER PRIMARY KEY,
         chat_id INTEGER NOT NULL,
         status TEXT DEFAULT 'active',
+        daily_search_limit INTEGER DEFAULT 2,
+        is_admin INTEGER DEFAULT 0,
+        blocked_reason TEXT,
+        last_seen_at TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
+    _add_column_if_missing(cursor, "users", "daily_search_limit", "daily_search_limit INTEGER DEFAULT 2")
+    _add_column_if_missing(cursor, "users", "is_admin", "is_admin INTEGER DEFAULT 0")
+    _add_column_if_missing(cursor, "users", "blocked_reason", "blocked_reason TEXT")
+    _add_column_if_missing(cursor, "users", "last_seen_at", "last_seen_at TEXT")
     
     # 2. User Searches Table (Scalable, multi-user, multi-search config)
     cursor.execute("""
@@ -353,6 +361,45 @@ def init_db():
     )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_route_subscriptions_active ON route_subscriptions(is_active, user_id, route_id)")
+
+    # 9. Billable search run log for quotas and admin visibility.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS search_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        search_id INTEGER,
+        run_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        metadata_json TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        finished_at TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(user_id),
+        FOREIGN KEY(search_id) REFERENCES user_searches(id)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_runs_user_created ON search_runs(user_id, created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_runs_status ON search_runs(status, created_at)")
+
+    # 10. Owner approval requests for extra searches beyond quota.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS approval_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        search_id INTEGER,
+        request_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        requested_payload_json TEXT DEFAULT '{}',
+        admin_user_id INTEGER,
+        admin_note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        decided_at TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(user_id),
+        FOREIGN KEY(search_id) REFERENCES user_searches(id)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status, created_at)")
     
     conn.commit()
     
@@ -416,14 +463,211 @@ def init_db():
     logger.info("Database initialized and default transit hubs / manual legs seeded.")
 
 # CRUD operations
-def register_user(user_id: int, chat_id: int):
+def register_user(user_id: int, chat_id: int, is_admin: int = 0):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    seen_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    INSERT INTO users (user_id, chat_id, daily_search_limit, is_admin, last_seen_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+        chat_id = excluded.chat_id,
+        is_admin = CASE WHEN excluded.is_admin = 1 THEN 1 ELSE users.is_admin END,
+        last_seen_at = excluded.last_seen_at
+    """, (user_id, chat_id, DEFAULT_DAILY_SEARCH_LIMIT, is_admin, seen_at))
+    conn.commit()
+    conn.close()
+
+def get_user(user_id: int) -> dict | None:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def set_user_daily_limit(user_id: int, daily_limit: int) -> bool:
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-    INSERT OR IGNORE INTO users (user_id, chat_id) VALUES (?, ?)
-    """, (user_id, chat_id))
+    UPDATE users
+    SET daily_search_limit = ?
+    WHERE user_id = ?
+    """, (max(0, int(daily_limit)), user_id))
+    changed = cursor.rowcount > 0
     conn.commit()
     conn.close()
+    return changed
+
+def set_user_blocked(user_id: int, blocked_reason: str | None) -> bool:
+    status = "blocked" if blocked_reason else "active"
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE users
+    SET status = ?, blocked_reason = ?
+    WHERE user_id = ?
+    """, (status, blocked_reason, user_id))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+def count_user_runs_today(user_id: int) -> int:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT COUNT(*) AS cnt
+    FROM search_runs
+    WHERE user_id = ?
+      AND status IN ('started', 'completed', 'failed')
+      AND date(created_at) = date('now')
+    """, (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return int(row["cnt"] if row else 0)
+
+def create_search_run(user_id: int, chat_id: int, run_type: str, search_id: int | None = None,
+                      metadata: dict | None = None) -> int:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO search_runs (user_id, chat_id, search_id, run_type, status, metadata_json)
+    VALUES (?, ?, ?, ?, 'started', ?)
+    """, (user_id, chat_id, search_id, run_type, json.dumps(metadata or {}, ensure_ascii=False)))
+    run_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return run_id
+
+def finish_search_run(run_id: int, status: str = "completed", metadata: dict | None = None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    finished_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    if metadata is None:
+        cursor.execute("""
+        UPDATE search_runs
+        SET status = ?, finished_at = ?
+        WHERE id = ?
+        """, (status, finished_at, run_id))
+    else:
+        cursor.execute("""
+        UPDATE search_runs
+        SET status = ?, finished_at = ?, metadata_json = ?
+        WHERE id = ?
+        """, (status, finished_at, json.dumps(metadata, ensure_ascii=False), run_id))
+    conn.commit()
+    conn.close()
+
+def create_approval_request(user_id: int, chat_id: int, request_type: str, search_id: int | None = None,
+                            requested_payload: dict | None = None, admin_note: str | None = None) -> int:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO approval_requests (
+        user_id, chat_id, search_id, request_type, status,
+        requested_payload_json, admin_note
+    )
+    VALUES (?, ?, ?, ?, 'pending', ?, ?)
+    """, (
+        user_id,
+        chat_id,
+        search_id,
+        request_type,
+        json.dumps(requested_payload or {}, ensure_ascii=False),
+        admin_note,
+    ))
+    request_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return request_id
+
+def get_approval_request(request_id: int) -> dict | None:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM approval_requests WHERE id = ?", (request_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def list_pending_approval_requests(limit: int = 20) -> list[dict]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT ar.*, u.status AS user_status, u.daily_search_limit
+    FROM approval_requests ar
+    LEFT JOIN users u ON u.user_id = ar.user_id
+    WHERE ar.status = 'pending'
+    ORDER BY ar.created_at ASC
+    LIMIT ?
+    """, (limit,))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def decide_approval_request(request_id: int, admin_user_id: int, status: str, admin_note: str | None = None) -> dict | None:
+    if status not in ("approved", "denied"):
+        raise ValueError("status must be approved or denied")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    decided_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    UPDATE approval_requests
+    SET status = ?, admin_user_id = ?, admin_note = ?, decided_at = ?
+    WHERE id = ? AND status = 'pending'
+    """, (status, admin_user_id, admin_note, decided_at, request_id))
+    if cursor.rowcount == 0:
+        conn.commit()
+        conn.close()
+        return None
+    cursor.execute("SELECT * FROM approval_requests WHERE id = ?", (request_id,))
+    row = cursor.fetchone()
+    conn.commit()
+    conn.close()
+    return dict(row) if row else None
+
+def get_admin_overview(limit: int = 20) -> dict:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) AS cnt FROM users")
+    users_total = int(cursor.fetchone()["cnt"])
+    cursor.execute("SELECT COUNT(*) AS cnt FROM user_searches WHERE is_active = 1")
+    active_searches = int(cursor.fetchone()["cnt"])
+    cursor.execute("""
+    SELECT COUNT(*) AS cnt FROM search_runs
+    WHERE date(created_at) = date('now')
+      AND status IN ('started', 'completed', 'failed')
+    """)
+    runs_today = int(cursor.fetchone()["cnt"])
+    cursor.execute("SELECT COUNT(*) AS cnt FROM approval_requests WHERE status = 'pending'")
+    pending_requests = int(cursor.fetchone()["cnt"])
+    cursor.execute("""
+    SELECT
+        u.user_id,
+        u.chat_id,
+        u.status,
+        u.daily_search_limit,
+        u.is_admin,
+        u.last_seen_at,
+        COUNT(sr.id) AS runs_today
+    FROM users u
+    LEFT JOIN search_runs sr
+      ON sr.user_id = u.user_id
+     AND date(sr.created_at) = date('now')
+     AND sr.status IN ('started', 'completed', 'failed')
+    GROUP BY u.user_id
+    ORDER BY runs_today DESC, u.last_seen_at DESC
+    LIMIT ?
+    """, (limit,))
+    users = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return {
+        "users_total": users_total,
+        "active_searches": active_searches,
+        "runs_today": runs_today,
+        "pending_requests": pending_requests,
+        "users": users,
+    }
 
 def save_user_search(user_id: int, origin_iata: str, destination_text: str, date_start: str, date_end: str, 
                      max_transfers: int, visa_allowed: int, lodging_exceptions: dict, max_budget: int,

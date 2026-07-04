@@ -1,4 +1,7 @@
+import json
+import os
 import re
+from pathlib import Path
 
 
 IATA_CITY_NAMES_RU = {
@@ -46,6 +49,17 @@ IATA_CITY_NAMES_RU = {
     "IST": "Стамбул",
     "SAW": "Стамбул Сабиха",
     "AYT": "Анталья",
+    "ESB": "Анкара",
+    "ADB": "Измир",
+    "DLM": "Даламан",
+    "BJV": "Бодрум",
+    "TZX": "Трабзон",
+    "ADA": "Адана",
+    "GZT": "Газиантеп",
+    "ASR": "Кайсери",
+    "KYA": "Конья",
+    "DIY": "Диярбакыр",
+    "ERZ": "Эрзурум",
     "DXB": "Дубай",
     "AUH": "Абу-Даби",
     "DOH": "Доха",
@@ -126,15 +140,66 @@ IATA_CITY_NAMES_RU = {
     "FRA": "Франкфурт",
     "BER": "Берлин",
     "ROM": "Рим",
+    "FCO": "Рим Фьюмичино",
+    "CIA": "Рим Чампино",
+    "MIL": "Милан",
+    "MXP": "Милан Мальпенса",
+    "LIN": "Милан Линате",
+    "VCE": "Венеция",
+    "NAP": "Неаполь",
     "IST": "Стамбул",
     "NYC": "Нью-Йорк",
     "JFK": "Нью-Йорк JFK",
     "LAX": "Лос-Анджелес",
 }
 
+AIRPORT_NAMES_CACHE_PATH = Path(os.getenv("AIRPORT_NAMES_CACHE_PATH", "airport_names_cache.json"))
+_DYNAMIC_IATA_NAMES_RU: dict[str, str] | None = None
+
+
+def _load_dynamic_names() -> dict[str, str]:
+    global _DYNAMIC_IATA_NAMES_RU
+    if _DYNAMIC_IATA_NAMES_RU is not None:
+        return _DYNAMIC_IATA_NAMES_RU
+    try:
+        if AIRPORT_NAMES_CACHE_PATH.exists():
+            data = json.loads(AIRPORT_NAMES_CACHE_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                _DYNAMIC_IATA_NAMES_RU = {
+                    str(code).upper(): str(name)
+                    for code, name in data.items()
+                    if len(str(code).strip()) == 3 and str(name).strip()
+                }
+                return _DYNAMIC_IATA_NAMES_RU
+    except Exception:
+        pass
+    _DYNAMIC_IATA_NAMES_RU = {}
+    return _DYNAMIC_IATA_NAMES_RU
+
+
+def remember_iata_name(code: str, name: str | None):
+    normalized = str(code or "").upper().strip()
+    clean_name = str(name or "").strip()
+    if len(normalized) != 3 or not normalized.isalpha() or not clean_name:
+        return
+    if IATA_CITY_NAMES_RU.get(normalized) == clean_name:
+        return
+    dynamic = _load_dynamic_names()
+    if dynamic.get(normalized) == clean_name:
+        return
+    dynamic[normalized] = clean_name
+    try:
+        AIRPORT_NAMES_CACHE_PATH.write_text(
+            json.dumps(dynamic, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
 
 def city_name_for_iata(code: str) -> str | None:
-    return IATA_CITY_NAMES_RU.get(str(code or "").upper())
+    normalized = str(code or "").upper()
+    return IATA_CITY_NAMES_RU.get(normalized) or _load_dynamic_names().get(normalized)
 
 
 def format_iata_city(code: str) -> str:

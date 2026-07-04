@@ -18,7 +18,11 @@ from db import (
     init_db, save_flight_cache, save_search_snapshot,
     get_route_snapshot, get_snapshot_routes, save_discovery_cache,
     get_discovery_cache, get_user_searches, subscribe_route,
-    get_user_route_subscriptions, deactivate_route_subscription
+    get_user_route_subscriptions, deactivate_route_subscription,
+    register_user, get_user, set_user_daily_limit, count_user_runs_today,
+    create_search_run, finish_search_run, create_approval_request,
+    list_pending_approval_requests, decide_approval_request,
+    get_admin_overview,
 )
 from solver import GraphSolver
 from analyst import LLMCognitiveAnalyst
@@ -243,6 +247,31 @@ async def run_test():
 
     _, more_rows = get_snapshot_routes(42, offset=5, limit=5, sort_mode="balanced")
     assert len(more_rows) > 0, "more_routes should return routes beyond the first page when available."
+
+    # 4b. Admin/quota helpers
+    logger.info("Testing admin quota and approval helpers...")
+    register_user(77, 7700)
+    user_77 = get_user(77)
+    assert user_77 is not None and int(user_77["daily_search_limit"]) == 2
+    assert set_user_daily_limit(77, 1)
+    assert count_user_runs_today(77) == 0
+    run_id = create_search_run(77, 7700, "new_search", search_id=None, metadata={"test": True})
+    assert count_user_runs_today(77) == 1
+    finish_search_run(run_id, "completed", {"best_price": 12345})
+    request_id = create_approval_request(
+        77,
+        7700,
+        "extra_search",
+        requested_payload={"run_type": "new_search", "user_id": 77, "chat_id": 7700}
+    )
+    pending = list_pending_approval_requests()
+    assert any(req["id"] == request_id for req in pending), "Pending approval request should be listed."
+    decided = decide_approval_request(request_id, admin_user_id=42, status="approved")
+    assert decided is not None and decided["status"] == "approved"
+    assert not any(req["id"] == request_id for req in list_pending_approval_requests()), "Approved request should leave pending queue."
+    overview = get_admin_overview()
+    assert overview["users_total"] >= 1
+    assert overview["runs_today"] >= 1
 
     # 5. Low Budget Fallback Test
     logger.info("Testing solver fallback for low budget (5,000 RUB)...")

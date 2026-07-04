@@ -14,7 +14,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY
+from config import (
+    TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY,
+    ADMIN_USER_IDS, DEFAULT_DAILY_SEARCH_LIMIT,
+)
 from db import (
     register_user, save_user_search, get_user_searches, delete_user_search,
     get_all_active_searches, update_last_checked_price, get_all_transit_hubs,
@@ -23,13 +26,17 @@ from db import (
     clear_price_cache_for_edges, get_cache_status_for_search,
     get_db_connection, update_price_drop_threshold,
     subscribe_route, get_user_route_subscriptions, get_all_active_route_subscriptions,
-    update_route_subscription_baseline, deactivate_route_subscription
+    update_route_subscription_baseline, deactivate_route_subscription,
+    get_user, set_user_daily_limit, count_user_runs_today,
+    create_search_run, finish_search_run, create_approval_request,
+    list_pending_approval_requests, decide_approval_request,
+    get_admin_overview,
 )
 from providers import TravelpayoutsProvider
 from solver import GraphSolver
 from analyst import LLMCognitiveAnalyst
 from discovery import RouteDiscoveryService
-from airport_names import annotate_iata_codes, format_iata_city
+from airport_names import annotate_iata_codes, format_iata_city, remember_iata_name
 from monitoring import (
     DEFAULT_PRICE_DROP_THRESHOLD_PCT,
     PRICE_DROP_THRESHOLD_OPTIONS,
@@ -211,8 +218,86 @@ async def call_llm(prompt: str) -> str:
 
     return ""
 
+def _valid_iata(value: str | None) -> str | None:
+    code = str(value or "").upper().strip()
+    if len(code) == 3 and code.isalpha():
+        return code
+    return None
+
+def _place_name_ru(place: dict) -> str:
+    name = place.get("name") or place.get("city_name") or place.get("main_airport_name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    names = place.get("names")
+    if isinstance(names, dict):
+        for key in ("ru", "en"):
+            value = names.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+async def travelpayouts_autocomplete_places(text: str, types: list[str] | None = None) -> list[dict]:
+    """Resolve free-text places through Travelpayouts/Aviasales public autocomplete."""
+    import httpx
+
+    term = (text or "").strip()
+    if not term:
+        return []
+    params = [("term", term), ("locale", "ru")]
+    for place_type in (types or ["city", "airport", "country"]):
+        params.append(("types[]", place_type))
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            response = await client.get("https://autocomplete.travelpayouts.com/places2", params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning("Travelpayouts autocomplete failed for %s: %s", term, e)
+        return []
+
+async def resolve_place_with_autocomplete(text: str, is_country: bool = False) -> dict | None:
+    types = ["country"] if is_country else ["city", "airport"]
+    places = await travelpayouts_autocomplete_places(text, types=types)
+    for place in places:
+        if is_country:
+            country_code = str(place.get("code") or place.get("country_code") or "").upper().strip()
+            if len(country_code) == 2 and country_code.isalpha():
+                return {"iata": country_code, "resolved_name": _place_name_ru(place) or text}
+            continue
+        code = _valid_iata(place.get("code") or place.get("city_code"))
+        if code:
+            name = _place_name_ru(place) or text
+            remember_iata_name(code, name)
+            return {"iata": code, "resolved_name": name}
+    return None
+
+async def hydrate_iata_names(codes) -> None:
+    unknown = []
+    for raw_code in codes or []:
+        code = _valid_iata(raw_code)
+        if code and format_iata_city(code) == code and code not in unknown:
+            unknown.append(code)
+    for code in unknown[:80]:
+        places = await travelpayouts_autocomplete_places(code, types=["city", "airport"])
+        for place in places:
+            place_code = _valid_iata(place.get("code") or place.get("city_code"))
+            if place_code == code:
+                remember_iata_name(code, _place_name_ru(place))
+                break
+
 async def parse_location_with_llm(text: str, is_country: bool = False) -> dict:
     """Uses LLM to resolve text names to airport/city/country IATA codes."""
+    explicit = str(text or "").upper().strip()
+    if is_country and len(explicit) == 2 and explicit.isalpha():
+        return {"iata": explicit, "resolved_name": text}
+    if not is_country and _valid_iata(explicit):
+        return {"iata": explicit, "resolved_name": format_iata_city(explicit)}
+
+    autocomplete = await resolve_place_with_autocomplete(text, is_country=is_country)
+    if autocomplete:
+        return autocomplete
+
     role = "код страны ISO 3166-1 alpha-2 (например, CN для Китая, VN для Вьетнама, TH для Таиланда)" if is_country else "3-буквенный IATA код аэропорта/города (например, UFA для Уфы, MOW для Москвы, PEK для Пекина)"
     prompt = f"""
 Преобразуй название '{text}' в {role}.
@@ -223,14 +308,19 @@ async def parse_location_with_llm(text: str, is_country: bool = False) -> dict:
     if resp_text:
         try:
             cleaned = resp_text.strip().replace("```json", "").replace("```", "")
-            return json.loads(cleaned)
+            parsed = json.loads(cleaned)
+            code = str(parsed.get("iata", "")).upper().strip()
+            if (is_country and len(code) == 2 and code.isalpha()) or (not is_country and _valid_iata(code)):
+                if not is_country:
+                    remember_iata_name(code, parsed.get("resolved_name"))
+                return {"iata": code, "resolved_name": parsed.get("resolved_name", text)}
         except Exception as e:
             logger.error(f"Failed to parse LLM location response JSON: {e}. Raw response: {resp_text}")
 
     # Fallback if no LLM key or call failed
     if is_country:
-        return {"iata": "CN" if "кит" in text.lower() else text.upper()[:2], "resolved_name": text}
-    return {"iata": "UFA" if "уф" in text.lower() else text.upper()[:3], "resolved_name": text}
+        return {"iata": "CN" if "кит" in text.lower() else "", "resolved_name": text}
+    return {"iata": "UFA" if "уф" in text.lower() else "", "resolved_name": text}
 
 async def get_airports_for_country_with_llm(country_code: str) -> list[str]:
     """Uses LLM to resolve country code to top 5-8 airport IATA codes in that country (Codex B)."""
@@ -337,9 +427,25 @@ async def parse_destination_with_llm(text: str) -> dict:
     # 2. Explicit IATA list typed by the user (e.g. "PVG, PEK").
     explicit = [t.strip().upper() for t in re.split(r"[,/\s]+", raw) if len(t.strip()) == 3 and t.strip().isalpha()]
     if explicit and len(explicit) == len([t for t in re.split(r"[,/\s]+", raw) if t.strip()]):
+        for code in explicit:
+            remember_iata_name(code, format_iata_city(code))
         return {"kind": "city", "iata_list": explicit, "resolved_name": raw}
 
-    # 3. LLM structured resolution.
+    # 3. Public autocomplete works without an LLM key and covers arbitrary cities/countries.
+    places = await travelpayouts_autocomplete_places(raw, types=["city", "airport", "country"])
+    for place in places:
+        place_type = str(place.get("type") or "").lower()
+        name = _place_name_ru(place) or raw
+        if place_type == "country":
+            country = str(place.get("code") or place.get("country_code") or "").upper().strip()
+            if len(country) == 2 and country.isalpha():
+                return {"kind": "country", "iata_list": [country], "resolved_name": name}
+        code = _valid_iata(place.get("code") or place.get("city_code"))
+        if code:
+            remember_iata_name(code, name)
+            return {"kind": "city", "iata_list": [code], "resolved_name": name}
+
+    # 4. LLM structured resolution.
     prompt = f"""
 Определи пункт назначения из текста: '{raw}'.
 Это либо СТРАНА (например, Китай, Таиланд), либо конкретный ГОРОД/города
@@ -362,6 +468,8 @@ async def parse_destination_with_llm(text: str) -> dict:
                 if isinstance(c, str) and len(c.strip()) == 3 and c.strip().isalpha()
             ]
             if kind == "city" and iata_list:
+                for code in iata_list:
+                    remember_iata_name(code, parsed.get("resolved_name"))
                 return {"kind": "city", "iata_list": iata_list, "resolved_name": parsed.get("resolved_name", raw)}
             country = str(parsed.get("country_code", "")).upper().strip()
             if country:
@@ -369,7 +477,7 @@ async def parse_destination_with_llm(text: str) -> dict:
         except Exception as e:
             logger.error(f"Failed to parse destination JSON: {e}. Raw: {resp_text}")
 
-    # 4. Fallback: legacy country-code resolver.
+    # 5. Fallback: legacy country-code resolver.
     legacy = await parse_location_with_llm(raw, is_country=True)
     return {"kind": "country", "iata_list": [legacy["iata"]], "resolved_name": legacy.get("resolved_name", raw)}
 
@@ -518,6 +626,205 @@ def subscription_actions_keyboard(subscription_id: int, route_id: str):
     builder.button(text="Отписаться", callback_data=f"unsubroute:{subscription_id}")
     builder.adjust(1, 1)
     return builder.as_markup()
+
+def admin_request_keyboard(request_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Одобрить", callback_data=f"admin_approve:{request_id}")
+    builder.button(text="Отклонить", callback_data=f"admin_deny:{request_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def is_admin_user(user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    if int(user_id) in ADMIN_USER_IDS:
+        return True
+    user = get_user(int(user_id))
+    return bool(user and int(user.get("is_admin") or 0) == 1)
+
+def _quota_usage_text(user_id: int) -> str:
+    user = get_user(user_id) or {}
+    used = count_user_runs_today(user_id)
+    limit = int(user.get("daily_search_limit") or DEFAULT_DAILY_SEARCH_LIMIT)
+    return f"{used}/{limit}"
+
+async def register_message_user(message: types.Message):
+    await asyncio.to_thread(
+        register_user,
+        message.from_user.id,
+        message.chat.id,
+        1 if message.from_user.id in ADMIN_USER_IDS else 0,
+    )
+
+def _request_summary(payload: dict) -> str:
+    run_type = payload.get("run_type", "")
+    if run_type in ("new_search", "refresh_search"):
+        cfg = payload.get("search_config") or {}
+        return (
+            f"{cfg.get('origin_iata', '?')} -> {cfg.get('dest_iata', '?')}, "
+            f"{cfg.get('date_start', '?')} — {cfg.get('date_end', '?')}, "
+            f"бюджет {cfg.get('max_budget', '?')}"
+        )
+    if run_type == "check_route":
+        return (
+            f"{payload.get('origin', '?')} -> {payload.get('destination', '?')} "
+            f"на {payload.get('depart_date', '?')}"
+        )
+    return run_type or "extra_search"
+
+async def notify_admins_about_request(request_id: int, payload: dict):
+    if not ADMIN_USER_IDS:
+        logger.warning("Approval request %s created, but ADMIN_USER_IDS is empty.", request_id)
+        return
+    user_id = payload.get("user_id")
+    text = (
+        f"🛂 *Новая заявка #{request_id} на поиск сверх лимита*\n"
+        f"Пользователь: `{user_id}`\n"
+        f"Использовано сегодня: `{_quota_usage_text(int(user_id)) if user_id else 'нет данных'}`\n"
+        f"Тип: `{payload.get('run_type', 'extra_search')}`\n"
+        f"Запрос: {analyst.renderer.clean_text(_request_summary(payload))}"
+    )
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=admin_request_keyboard(request_id), parse_mode="Markdown")
+        except Exception as e:
+            logger.error("Failed to notify admin %s about request %s: %s", admin_id, request_id, e)
+
+async def reserve_or_request_search_run(
+    message_or_chat,
+    user_id: int,
+    chat_id: int,
+    run_type: str,
+    payload: dict,
+    search_id: int | None = None,
+) -> int | None:
+    await asyncio.to_thread(register_user, user_id, chat_id, 1 if user_id in ADMIN_USER_IDS else 0)
+    user = await asyncio.to_thread(get_user, user_id)
+    if user and user.get("status") == "blocked":
+        reason = user.get("blocked_reason") or "доступ ограничен"
+        await bot.send_message(chat_id, f"⛔ Поиск недоступен: {reason}")
+        return None
+
+    if is_admin_user(user_id):
+        return await asyncio.to_thread(
+            create_search_run,
+            user_id,
+            chat_id,
+            run_type,
+            search_id,
+            {"admin_bypass": True},
+        )
+
+    used = await asyncio.to_thread(count_user_runs_today, user_id)
+    daily_limit = int((user or {}).get("daily_search_limit") or DEFAULT_DAILY_SEARCH_LIMIT)
+    if used < daily_limit:
+        return await asyncio.to_thread(
+            create_search_run,
+            user_id,
+            chat_id,
+            run_type,
+            search_id,
+            {"quota_used_before": used, "daily_limit": daily_limit},
+        )
+
+    request_payload = dict(payload)
+    request_payload.update({
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "run_type": run_type,
+        "search_id": search_id,
+    })
+    request_id = await asyncio.to_thread(
+        create_approval_request,
+        user_id,
+        chat_id,
+        "extra_search",
+        search_id,
+        request_payload,
+        f"quota {used}/{daily_limit}",
+    )
+    await bot.send_message(
+        chat_id,
+        "⏳ Лимит поисков на сегодня использован "
+        f"({used}/{daily_limit}). Я отправил заявку админу.\n"
+        f"ID заявки: `{request_id}`",
+        parse_mode="Markdown",
+    )
+    await notify_admins_about_request(request_id, request_payload)
+    return None
+
+async def require_admin(message: types.Message) -> bool:
+    await register_message_user(message)
+    if is_admin_user(message.from_user.id):
+        return True
+    await message.answer("⛔ Эта команда доступна только админу.")
+    return False
+
+def render_admin_request(req: dict) -> str:
+    payload = json.loads(req.get("requested_payload_json") or "{}")
+    return (
+        f"#{req['id']} | user `{req['user_id']}` | `{req['request_type']}` | "
+        f"{analyst.renderer.clean_text(_request_summary(payload))} | "
+        f"{req.get('created_at')}"
+    )
+
+async def run_approved_check_route(payload: dict, run_id: int):
+    user_id = int(payload["user_id"])
+    chat_id = int(payload["chat_id"])
+    origin = payload["origin"]
+    destination = payload["destination"]
+    depart_date = payload["depart_date"]
+    try:
+        await bot.send_message(chat_id, f"✅ Заявка одобрена. Проверяю `{origin}` -> `{destination}` на {depart_date}...")
+        options = await provider.get_prices(origin, destination, depart_date, direct_only=True, cache_mode="fresh")
+        same_day_options = [item for item in options if item.get("depart_date") == depart_date]
+        options = sorted(same_day_options or options, key=lambda item: item.get("price", 0))[:5]
+        if not options:
+            await asyncio.to_thread(finish_search_run, run_id, "completed", {"results": 0, "approved": True})
+            await bot.send_message(chat_id, "Свежих прямых вариантов не нашел.")
+            return
+        lines = [f"🔎 *Свежая проверка сегмента* `{format_iata_city(origin)}` -> `{format_iata_city(destination)}` на {depart_date}\n"]
+        for index, option in enumerate(options, start=1):
+            price = float(option.get("price", 0) or 0)
+            departure_at = option.get("departure_at") or option.get("depart_date") or depart_date
+            airline = option.get("airline") or "?"
+            flight_number = option.get("flight_number") or ""
+            duration_min = int(option.get("duration", 0) or 0)
+            duration_text = f"{duration_min // 60} ч {duration_min % 60} мин" if duration_min else "время не указано"
+            link = f"https://www.aviasales.ru/search/{origin}{depart_date[8:10]}{depart_date[5:7]}{destination}1"
+            lines.append(f"{index}) {price:,.0f} ₽ | {departure_at} | {airline}{flight_number} | {duration_text}\n{link}")
+        await asyncio.to_thread(finish_search_run, run_id, "completed", {"results": len(options), "approved": True})
+        await send_message_safely(chat_id, "\n".join(lines))
+    except Exception as e:
+        await asyncio.to_thread(finish_search_run, run_id, "failed", {"error": str(e), "approved": True})
+        logger.error("Approved check_route failed for user %s: %s", user_id, e)
+
+async def execute_approved_request(req: dict, admin_user_id: int) -> bool:
+    payload = json.loads(req.get("requested_payload_json") or "{}")
+    user_id = int(req["user_id"])
+    chat_id = int(req["chat_id"])
+    run_type = payload.get("run_type") or "approved_search"
+    search_id = req.get("search_id")
+    run_id = await asyncio.to_thread(
+        create_search_run,
+        user_id,
+        chat_id,
+        run_type,
+        search_id,
+        {"approved_by": admin_user_id, "approval_request_id": req["id"]},
+    )
+    if run_type in ("new_search", "refresh_search"):
+        search_config = payload.get("search_config") or {}
+        await bot.send_message(chat_id, f"✅ Заявка #{req['id']} одобрена. Запускаю поиск.")
+        asyncio.create_task(run_search_and_update_baseline(user_id, chat_id, search_config, run_id=run_id))
+        return True
+    if run_type == "check_route":
+        asyncio.create_task(run_approved_check_route(payload, run_id))
+        return True
+
+    await asyncio.to_thread(finish_search_run, run_id, "failed", {"error": f"unknown run_type {run_type}"})
+    await bot.send_message(chat_id, f"Заявка #{req['id']} одобрена, но тип запуска не поддержан: {run_type}.")
+    return False
 
 def _route_line(route: dict) -> str:
     duration_hours = float(route.get("duration_hours") or 0)
@@ -731,7 +1038,7 @@ async def _candidate_edges_for_saved_search(user_id: int, search: dict, destinat
 # Command Handlers
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await asyncio.to_thread(register_user, message.from_user.id, message.chat.id)
+    await register_message_user(message)
     welcome_text = (
         "👋 Привет! Я умный бот-маршрутизатор билетов.\n\n"
         "Я умею искать хитрые каскадные маршруты с пересадками и стоповерами (остановками в городах на 2-5 дней), "
@@ -749,10 +1056,143 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Настройка мониторинга отменена. Возвращаемся в меню.", reply_markup=types.ReplyKeyboardRemove())
 
+@router.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if not await require_admin(message):
+        return
+    overview = await asyncio.to_thread(get_admin_overview, 8)
+    lines = [
+        "🛠️ *Админ-панель*",
+        f"Пользователей: `{overview['users_total']}`",
+        f"Активных поисков: `{overview['active_searches']}`",
+        f"Запусков сегодня: `{overview['runs_today']}`",
+        f"Заявок на одобрение: `{overview['pending_requests']}`",
+        "",
+        "Команды:",
+        "`/admin_users` — пользователи и лимиты",
+        "`/admin_requests` — pending-заявки",
+        "`/set_limit <user_id> <число>` — лимит поисков в день",
+        "`/approve <id>` / `/deny <id>` — решение по заявке",
+    ]
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+@router.message(Command("admin_users"))
+async def cmd_admin_users(message: types.Message):
+    if not await require_admin(message):
+        return
+    overview = await asyncio.to_thread(get_admin_overview, 20)
+    lines = ["👥 *Пользователи*"]
+    for user in overview["users"]:
+        label = "admin" if int(user.get("is_admin") or 0) else user.get("status", "active")
+        lines.append(
+            f"`{user['user_id']}` | {label} | сегодня {user.get('runs_today', 0)}/{user.get('daily_search_limit')} | "
+            f"last_seen: {user.get('last_seen_at') or 'нет'}"
+        )
+    await send_message_safely(message.chat.id, "\n".join(lines))
+
+@router.message(Command("admin_requests"))
+async def cmd_admin_requests(message: types.Message):
+    if not await require_admin(message):
+        return
+    requests = await asyncio.to_thread(list_pending_approval_requests, 20)
+    if not requests:
+        await message.answer("Заявок на одобрение нет.")
+        return
+    await message.answer("🛂 *Заявки на одобрение*", parse_mode="Markdown")
+    for req in requests:
+        await message.answer(render_admin_request(req), reply_markup=admin_request_keyboard(req["id"]), parse_mode="Markdown")
+
+@router.message(Command("set_limit"))
+async def cmd_set_limit(message: types.Message):
+    if not await require_admin(message):
+        return
+    args = (message.text or "").split()
+    if len(args) < 3:
+        await message.answer("Использование: `/set_limit <user_id> <лимит_в_день>`")
+        return
+    try:
+        user_id = int(args[1])
+        daily_limit = int(args[2])
+    except ValueError:
+        await message.answer("Нужны числовые user_id и лимит.")
+        return
+    changed = await asyncio.to_thread(set_user_daily_limit, user_id, daily_limit)
+    await message.answer(
+        f"✅ Лимит пользователя `{user_id}` установлен: {max(0, daily_limit)} в день."
+        if changed else
+        f"Не нашел пользователя `{user_id}`. Пусть сначала напишет /start боту.",
+        parse_mode="Markdown",
+    )
+
+async def handle_approval_decision(message_or_callback, request_id: int, approve: bool):
+    admin_user_id = message_or_callback.from_user.id
+    if not is_admin_user(admin_user_id):
+        if isinstance(message_or_callback, types.CallbackQuery):
+            await message_or_callback.answer("Только для админа", show_alert=True)
+        else:
+            await message_or_callback.answer("⛔ Эта команда доступна только админу.")
+        return
+
+    status = "approved" if approve else "denied"
+    req = await asyncio.to_thread(decide_approval_request, request_id, admin_user_id, status, None)
+    if not req:
+        text = "Заявка не найдена или уже обработана."
+        if isinstance(message_or_callback, types.CallbackQuery):
+            await message_or_callback.answer(text, show_alert=True)
+        else:
+            await message_or_callback.answer(text)
+        return
+
+    if approve:
+        await execute_approved_request(req, admin_user_id)
+        text = f"✅ Заявка #{request_id} одобрена и запущена."
+    else:
+        await bot.send_message(req["chat_id"], f"❌ Заявка #{request_id} на дополнительный поиск отклонена.")
+        text = f"❌ Заявка #{request_id} отклонена."
+
+    if isinstance(message_or_callback, types.CallbackQuery):
+        await message_or_callback.answer(text, show_alert=False)
+        try:
+            await message_or_callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    else:
+        await message_or_callback.answer(text)
+
+@router.message(Command("approve"))
+async def cmd_approve(message: types.Message):
+    if not await require_admin(message):
+        return
+    args = (message.text or "").split()
+    if len(args) < 2:
+        await message.answer("Использование: `/approve <id_заявки>`")
+        return
+    try:
+        request_id = int(args[1])
+    except ValueError:
+        await message.answer("Неверный ID заявки.")
+        return
+    await handle_approval_decision(message, request_id, True)
+
+@router.message(Command("deny"))
+async def cmd_deny(message: types.Message):
+    if not await require_admin(message):
+        return
+    args = (message.text or "").split()
+    if len(args) < 2:
+        await message.answer("Использование: `/deny <id_заявки>`")
+        return
+    try:
+        request_id = int(args[1])
+    except ValueError:
+        await message.answer("Неверный ID заявки.")
+        return
+    await handle_approval_decision(message, request_id, False)
+
 # Search Wizard Implementation
 @router.message(Command("new_search", "newsearch"))
 async def cmd_new_search(message: types.Message, state: FSMContext):
-    await asyncio.to_thread(register_user, message.from_user.id, message.chat.id)
+    await register_message_user(message)
     await state.clear()
     await state.set_state(SearchWizard.waiting_for_origin)
     await message.answer("🏙️ **Шаг 1 из 11:** Откуда летим?\nНапишите название города (например, Уфа) или его IATA-код (UFA):")
@@ -763,6 +1203,12 @@ async def process_origin(message: types.Message, state: FSMContext):
     status_msg = await message.answer("🔍 Распознаю город...")
     resolved = await parse_location_with_llm(origin_text, is_country=False)
     await status_msg.delete()
+    if not resolved.get("iata"):
+        await message.answer(
+            "❌ Не смог надежно определить город отправления. "
+            "Попробуйте написать IATA-код аэропорта/города, например `UFA`, `IST`, `MOW`."
+        )
+        return
 
     await state.update_data(origin_iata=resolved["iata"], origin_name=resolved.get("resolved_name", origin_text))
     await state.set_state(SearchWizard.waiting_for_destination)
@@ -780,6 +1226,12 @@ async def process_destination(message: types.Message, state: FSMContext):
     status_msg = await message.answer("🔍 Распознаю направление...")
     resolved = await parse_destination_with_llm(dest_text)
     await status_msg.delete()
+    if not resolved.get("iata_list") or not resolved["iata_list"][0]:
+        await message.answer(
+            "❌ Не смог надежно определить направление. "
+            "Попробуйте страну, город или IATA-код, например `Турция`, `Стамбул`, `IST`."
+        )
+        return
 
     if resolved["kind"] == "city":
         # City-level target: store explicit airport list, e.g. "PVG,SHA,PEK".
@@ -1065,22 +1517,6 @@ async def process_exclusions(message: types.Message, state: FSMContext):
         "allow_awkward_layovers": data.get("allow_awkward_layovers", 1),
     })
 
-    await message.answer(
-        "🎉 **Поиск сохранен и запущен!**\n\n"
-        f"🆔 ID поиска: `{search_id}`\n"
-        f"📍 Маршрут: `{data['origin_name']} ({data['origin_iata']})` ➔ `{data['dest_name']} ({data['dest_iata']})`\n"
-        f"📅 Период: {data['date_start']} — {data['date_end']}\n"
-        f"💰 Бюджет: до {data['max_budget']:,} ₽\n"
-        f"🔔 Алерт при падении: {format_price_drop_threshold(data.get('price_drop_threshold_pct'))}\n"
-        f"🎒 Багаж: {'Да' if data['baggage_needed'] else 'Нет'}\n"
-        f"✈️ Макс. перелетов: {data['max_transfers'] + 1}\n\n"
-        f"⏱️ Стоповеры: {stopover_summary}\n\n"
-        f"🛂 Визы: {format_visa_mode(data.get('visa_mode', 'visa_free_only'))}\n\n"
-        "🤖 Я запускаю расчет билетов через API и нейросеть. Это займет около 30-60 секунд.\n"
-        "После выдачи выберите подходящие маршруты кнопкой *Подписаться на маршрут*."
-    )
-
-    # Trigger immediate calculation
     immediate_config = {
         "search_id": search_id,
         "origin_iata": data["origin_iata"],
@@ -1100,7 +1536,36 @@ async def process_exclusions(message: types.Message, state: FSMContext):
         "visa_mode": data.get("visa_mode", "visa_free_only"),
         "price_drop_threshold_pct": data.get("price_drop_threshold_pct", DEFAULT_PRICE_DROP_THRESHOLD_PCT),
     }
-    asyncio.create_task(run_search_and_update_baseline(message.from_user.id, message.chat.id, immediate_config))
+    run_id = await reserve_or_request_search_run(
+        message,
+        message.from_user.id,
+        message.chat.id,
+        "new_search",
+        {"search_config": immediate_config},
+        search_id,
+    )
+    if not run_id:
+        await message.answer(
+            "✅ Поиск сохранен, но расчет пока не запущен. "
+            "Если админ одобрит заявку, я запущу его автоматически."
+        )
+        return
+
+    await message.answer(
+        "🎉 **Поиск сохранен и запущен!**\n\n"
+        f"🆔 ID поиска: `{search_id}`\n"
+        f"📍 Маршрут: `{data['origin_name']} ({data['origin_iata']})` ➔ `{data['dest_name']} ({data['dest_iata']})`\n"
+        f"📅 Период: {data['date_start']} — {data['date_end']}\n"
+        f"💰 Бюджет: до {data['max_budget']:,} ₽\n"
+        f"🔔 Алерт при падении: {format_price_drop_threshold(data.get('price_drop_threshold_pct'))}\n"
+        f"🎒 Багаж: {'Да' if data['baggage_needed'] else 'Нет'}\n"
+        f"✈️ Макс. перелетов: {data['max_transfers'] + 1}\n\n"
+        f"⏱️ Стоповеры: {stopover_summary}\n\n"
+        f"🛂 Визы: {format_visa_mode(data.get('visa_mode', 'visa_free_only'))}\n\n"
+        "🤖 Я запускаю расчет билетов через API и нейросеть. Это займет около 30-60 секунд.\n"
+        "После выдачи выберите подходящие маршруты кнопкой *Подписаться на маршрут*."
+    )
+    asyncio.create_task(run_search_and_update_baseline(message.from_user.id, message.chat.id, immediate_config, run_id=run_id))
 
 @router.message(Command("my_searches", "mysearches"))
 async def cmd_my_searches(message: types.Message):
@@ -1291,8 +1756,19 @@ async def cmd_refresh_search(message: types.Message):
         "cache_mode": "fresh"  # Force bypass cache
     }
 
+    run_id = await reserve_or_request_search_run(
+        message,
+        message.from_user.id,
+        message.chat.id,
+        "refresh_search",
+        {"search_config": immediate_config},
+        search_id,
+    )
+    if not run_id:
+        return
+
     await message.answer(f"🔄 Запущен принудительный перерасчет поиска ID {search_id} в режиме реального времени (без кэша)...")
-    asyncio.create_task(run_search_and_update_baseline(message.from_user.id, message.chat.id, immediate_config))
+    asyncio.create_task(run_search_and_update_baseline(message.from_user.id, message.chat.id, immediate_config, run_id=run_id))
 
 @router.message(Command("cache_status"))
 async def cmd_cache_status(message: types.Message):
@@ -1575,6 +2051,17 @@ async def cmd_check_route(message: types.Message):
         await message.answer("❌ Укажите IATA-коды из 3 букв, например `UFA MOW`.")
         return
 
+    run_id = await reserve_or_request_search_run(
+        message,
+        message.from_user.id,
+        message.chat.id,
+        "check_route",
+        {"origin": origin, "destination": destination, "depart_date": depart_date},
+        None,
+    )
+    if not run_id:
+        return
+
     status_msg = await message.answer(f"🔎 Проверяю свежие цены `{format_iata_city(origin)}` -> `{format_iata_city(destination)}` на {depart_date}...")
     options = await provider.get_prices(origin, destination, depart_date, direct_only=True, cache_mode="fresh")
     same_day_options = [item for item in options if item.get("depart_date") == depart_date]
@@ -1586,6 +2073,7 @@ async def cmd_check_route(message: types.Message):
         pass
 
     if not options:
+        await asyncio.to_thread(finish_search_run, run_id, "completed", {"results": 0})
         await message.answer(
             f"Не нашел свежих прямых вариантов `{format_iata_city(origin)}` -> `{format_iata_city(destination)}` на {depart_date}.\n"
             "Если Aviasales показывает билет, возможно это чартер/агентский остаток, непрямой рейс или данные API еще не обновились."
@@ -1608,6 +2096,7 @@ async def cmd_check_route(message: types.Message):
             f"{link}"
         )
 
+    await asyncio.to_thread(finish_search_run, run_id, "completed", {"results": len(options)})
     await send_message_safely(message.chat.id, "\n".join(lines))
 
 @router.message(Command("more_routes", "more"))
@@ -1668,6 +2157,26 @@ async def cmd_routes_by_comfort(message: types.Message):
 @router.message(Command("routes_by_stopover"))
 async def cmd_routes_by_stopover(message: types.Message):
     await _send_sorted_routes(message, "stopover")
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("admin_approve:"))
+async def cb_admin_approve(callback: types.CallbackQuery):
+    _, request_id_raw = callback.data.split(":", 1)
+    try:
+        request_id = int(request_id_raw)
+    except ValueError:
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+    await handle_approval_decision(callback, request_id, True)
+
+@router.callback_query(lambda callback: callback.data and callback.data.startswith("admin_deny:"))
+async def cb_admin_deny(callback: types.CallbackQuery):
+    _, request_id_raw = callback.data.split(":", 1)
+    try:
+        request_id = int(request_id_raw)
+    except ValueError:
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+    await handle_approval_decision(callback, request_id, False)
 
 @router.callback_query(lambda callback: callback.data and callback.data.startswith("more:"))
 async def cb_more_routes(callback: types.CallbackQuery):
@@ -1942,6 +2451,11 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         for dest in destination_iatas:
             candidate_edges.add((origin, dest))
 
+    await hydrate_iata_names(
+        {origin, *destination_iatas}
+        | {code for edge in candidate_edges for code in edge}
+    )
+
     # Compile actual query tasks
     tasks = []
     for edge in candidate_edges:
@@ -2171,12 +2685,20 @@ async def run_single_search_and_send(user_id: int, chat_id: int, search_config: 
         logger.error(f"Failed to send telegram message: {e}")
         return 0
 
-async def run_search_and_update_baseline(user_id: int, chat_id: int, search_config: dict):
-    best_price = await run_single_search_and_send(user_id, chat_id, search_config, is_monitor_job=False)
-    search_id = search_config.get("search_id")
-    if search_id and best_price > 0:
-        await asyncio.to_thread(update_last_checked_price, search_id, best_price)
-    return best_price
+async def run_search_and_update_baseline(user_id: int, chat_id: int, search_config: dict, run_id: int | None = None):
+    try:
+        best_price = await run_single_search_and_send(user_id, chat_id, search_config, is_monitor_job=False)
+        search_id = search_config.get("search_id")
+        if search_id and best_price > 0:
+            await asyncio.to_thread(update_last_checked_price, search_id, best_price)
+        if run_id:
+            await asyncio.to_thread(finish_search_run, run_id, "completed", {"best_price": best_price})
+        return best_price
+    except Exception as e:
+        logger.error("Search run failed for user %s: %s", user_id, e)
+        if run_id:
+            await asyncio.to_thread(finish_search_run, run_id, "failed", {"error": str(e)})
+        raise
 
 # Scheduler job
 async def run_daily_monitoring_job():
