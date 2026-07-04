@@ -12,6 +12,7 @@ __pycache__/
 # Databases
 *.db
 *.sqlite
+airport_names_cache.json
 
 # OS files
 .DS_Store
